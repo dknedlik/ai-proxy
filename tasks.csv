@@ -1,3 +1,1 @@
 Title,Body,Labels
-"[1.14] Streaming interface (design + stub)","Goal: Define chat_stream return type and add default impl in trait (already wraps chat). Add TODO adapter methods; add NullProvider test using single-chunk vector. Acceptance: trait compiles; tests green.","epic:providers,size:S,priority:P2"
-"[1.17] Provider docs","Goal: Add docs/providers.md covering traits, capabilities, factory, routing, and adapter notes. Acceptance: file exists and linked from README.","epic:providers,size:S,priority:P2"

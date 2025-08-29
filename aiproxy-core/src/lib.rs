@@ -3,3 +3,4 @@ pub mod error;
 pub mod model;
 pub mod normalizer;
 pub mod provider;
+pub mod provider_factory;
