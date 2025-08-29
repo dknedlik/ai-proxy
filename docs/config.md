@@ -1,6 +1,3 @@
-
-
-
 # ai-proxy Configuration File
 
 ## 1. Overview
@@ -42,7 +39,7 @@ The `cache` section configures local caching to improve performance and reduce d
 }
 ```
 
-- **path:** Filesystem path where cache files are stored.
+- **path:** Filesystem path to the cache database, usually a SQLite file (e.g., `.aiproxy/cache.db`).
 - **ttl_seconds:** Time-to-live for cache entries, in seconds. Entries older than this are invalidated.
 
 ---
@@ -53,18 +50,22 @@ The `transcript` section configures logging of requests and responses for auditi
 
 ```json
 "transcript": {
-  "path": "./transcripts",
-  "fsync": "write"
+  "dir": "./transcripts",
+  "segment_mb": 64,
+  "redact_builtin": true,
+  "fsync": "commit"
 }
 ```
 
 | fsync Mode | Description                                      |
 |------------|--------------------------------------------------|
-| `none`     | No explicit fsync; may be faster, less durable   |
-| `write`    | Fsync after each write; safer, slightly slower   |
-| `batch`    | Fsync at intervals; compromise between speed and safety |
+| `off`      | No explicit fsync; may be faster, less durable   |
+| `commit`   | Fsync at commit points; balance between speed and safety |
+| `always`   | Fsync after each write; safest, slightly slower  |
 
-- **path:** Directory where transcript logs are stored.
+- **dir:** Directory where transcript logs are stored.
+- **segment_mb:** Maximum size in megabytes of each transcript segment file before rolling over.
+- **redact_builtin:** Whether to automatically redact sensitive information using built-in rules.
 - **fsync:** Controls how often data is flushed to disk for durability.
 
 ---
@@ -76,20 +77,20 @@ The `routing` section determines which provider handles a request based on the m
 ```json
 "routing": [
   {
-    "pattern": "^gpt-",
+    "model": "^gpt-",
     "provider": "openai"
   },
   {
-    "pattern": "^claude-",
+    "model": "^claude-",
     "provider": "anthropic"
   }
 ],
-"default_provider": "openai"
+"default": "openai"
 ```
 
-- **pattern:** Regular expression matched against the `model` field in requests.
-- **provider:** The provider to use if the pattern matches.
-- **default_provider:** Provider to use if no pattern matches.
+- **model:** Regular expression matched against the `model` field in requests.
+- **provider:** The provider to use if the model regex matches.
+- **default:** Provider to use if no model regex matches.
 
 ---
 
@@ -104,23 +105,26 @@ Below is a recommended minimal configuration:
   },
   "cache": {
     "path": "./cache",
-    "ttl_seconds": 3600
+    "ttl_seconds": 604800
   },
   "transcript": {
-    "path": "./transcripts",
-    "fsync": "write"
+    "dir": "./transcripts",
+    "segment_mb": 64,
+    "redact_builtin": true,
+    "fsync": "commit"
   },
   "routing": [
-    { "pattern": "^gpt-", "provider": "openai" }
+    { "model": "^gpt-", "provider": "openai" }
   ],
-  "default_provider": "openai"
+  "default": "openai"
 }
 ```
 
 **Best Practices:**
 - Use environment variables for API keys.
-- Set a reasonable cache TTL to balance freshness and performance.
-- Use `fsync: write` for transcript durability unless performance is critical.
+- Set a reasonable cache TTL of several days to a week to balance freshness and performance.
+- Use `fsync: commit` for transcript durability unless performance is critical.
+- Set `segment_mb` to 64 and enable `redact_builtin` to protect sensitive data.
 - Route requests explicitly by model name using regex patterns.
 
 ---
@@ -137,17 +141,19 @@ Below is a recommended minimal configuration:
   },
   "cache": {
     "path": "./cache",
-    "ttl_seconds": 3600
+    "ttl_seconds": 604800
   },
   "transcript": {
-    "path": "./transcripts",
-    "fsync": "write"
+    "dir": "./transcripts",
+    "segment_mb": 64,
+    "redact_builtin": true,
+    "fsync": "commit"
   },
   "routing": [
-    { "pattern": "^gpt-", "provider": "openai" },
-    { "pattern": "^claude-", "provider": "anthropic" }
+    { "model": "^gpt-", "provider": "openai" },
+    { "model": "^claude-", "provider": "anthropic" }
   ],
-  "default_provider": "openai"
+  "default": "openai"
 }
 ```
 
@@ -162,19 +168,21 @@ api_key_env = "ANTHROPIC_API_KEY"
 
 [cache]
 path = "./cache"
-ttl_seconds = 3600
+ttl_seconds = 604800
 
 [transcript]
-path = "./transcripts"
-fsync = "write"
+dir = "./transcripts"
+segment_mb = 64
+redact_builtin = true
+fsync = "commit"
 
 [[routing]]
-pattern = "^gpt-"
+model = "^gpt-"
 provider = "openai"
 
 [[routing]]
-pattern = "^claude-"
+model = "^claude-"
 provider = "anthropic"
 
-default_provider = "openai"
+default = "openai"
 ```

@@ -10,5 +10,7 @@ anyhow = "1"
 toml = "0.8"
 tempfile = { version = "3", optional = true }
 thiserror = "1"
+unicode-normalization = "0.1"
+
 [dev-dependencies]
 tempfile = "3"
