@@ -81,7 +81,10 @@ mod tests {
     fn chat_request_roundtrip() {
         let req = ChatRequest {
             model: "gpt-4o".to_string(),
-            messages: vec![ChatMessage { role: Role::User, content: "Hello".to_string() }],
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "Hello".to_string(),
+            }],
             temperature: Some(0.7),
             top_p: Some(0.9),
             metadata: None,
