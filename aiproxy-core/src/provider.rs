@@ -16,7 +16,7 @@ pub enum Capability {
 }
 
 #[async_trait]
-pub trait ChatProvider: Send + Sync {
+pub trait ChatProvider: Send + Sync + std::fmt::Debug {
     fn name(&self) -> &str;
     async fn chat(&self, req: ChatRequest) -> CoreResult<ChatResponse>;
     // streaming variant is optional
@@ -28,7 +28,7 @@ pub trait ChatProvider: Send + Sync {
 }
 
 #[async_trait]
-pub trait EmbedProvider: Send + Sync {
+pub trait EmbedProvider: Send + Sync + std::fmt::Debug {
     fn name(&self) -> &str;
     async fn embed(&self, req: EmbedRequest) -> CoreResult<EmbedResponse>;
 }
@@ -40,11 +40,14 @@ pub trait ProviderCaps {
 
 /// A dummy provider implementation that always returns canned responses.
 /// Useful for tests or as a placeholder.
+#[derive(Debug)]
 pub struct NullProvider;
 
 #[async_trait]
 impl ChatProvider for NullProvider {
-    fn name(&self) -> &str { "null" }
+    fn name(&self) -> &str {
+        "null"
+    }
 
     async fn chat(&self, req: ChatRequest) -> CoreResult<ChatResponse> {
         Ok(ChatResponse {
@@ -66,7 +69,9 @@ impl ChatProvider for NullProvider {
 
 #[async_trait]
 impl EmbedProvider for NullProvider {
-    fn name(&self) -> &str { "null" }
+    fn name(&self) -> &str {
+        "null"
+    }
 
     async fn embed(&self, req: EmbedRequest) -> CoreResult<EmbedResponse> {
         Ok(EmbedResponse {
@@ -95,7 +100,10 @@ mod tests {
         let prov = NullProvider;
         let req = ChatRequest {
             model: "gpt-4o".into(),
-            messages: vec![ChatMessage{ role: Role::User, content: "hi".into() }],
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "hi".into(),
+            }],
             temperature: Some(1.0),
             top_p: Some(1.0),
             metadata: None,
@@ -115,7 +123,11 @@ mod tests {
     #[tokio::test]
     async fn null_provider_embed() {
         let prov = NullProvider;
-        let req = EmbedRequest { model: "text-embedding-3-small".into(), inputs: vec!["a".into(), "b".into()], client_key: None };
+        let req = EmbedRequest {
+            model: "text-embedding-3-small".into(),
+            inputs: vec!["a".into(), "b".into()],
+            client_key: None,
+        };
         let resp = prov.embed(req).await.expect("embed ok");
         assert_eq!(resp.provider, "null");
         assert_eq!(resp.vectors.len(), 2);

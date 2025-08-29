@@ -15,9 +15,9 @@ pub enum ProviderKind {
 /// Registry of concrete provider instances by name.
 /// Names correspond to config keys (e.g., "openai", "anthropic", "openrouter", "null").
 pub struct ProviderRegistry {
-    chat: HashMap<String, Arc<dyn ChatProvider>>,   // name -> chat provider
+    chat: HashMap<String, Arc<dyn ChatProvider>>, // name -> chat provider
     embed: HashMap<String, Arc<dyn EmbedProvider>>, // name -> embed provider
-    caps: HashMap<String, &'static [Capability]>,   // name -> capabilities
+    caps: HashMap<String, &'static [Capability]>, // name -> capabilities
 }
 
 impl ProviderRegistry {
@@ -73,10 +73,25 @@ mod tests {
 
     fn minimal_cfg() -> Config {
         Config {
-            providers: Providers { openai: None, anthropic: None, openrouter: None },
-            cache: CacheCfg { path: ":memory:".into(), ttl_seconds: 60 },
-            transcript: TranscriptCfg { dir: ".tx".into(), segment_mb: 64, fsync: FsyncPolicy::Commit, redact_builtin: true },
-            routing: RoutingCfg { default: "null".into(), rules: vec![] },
+            providers: Providers {
+                openai: None,
+                anthropic: None,
+                openrouter: None,
+            },
+            cache: CacheCfg {
+                path: ":memory:".into(),
+                ttl_seconds: 60,
+            },
+            transcript: TranscriptCfg {
+                dir: ".tx".into(),
+                segment_mb: 64,
+                fsync: FsyncPolicy::Commit,
+                redact_builtin: true,
+            },
+            routing: RoutingCfg {
+                default: "null".into(),
+                rules: vec![],
+            },
         }
     }
 

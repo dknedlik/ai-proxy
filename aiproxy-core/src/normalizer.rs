@@ -1,11 +1,12 @@
 use crate::model::{ChatRequest, EmbedRequest};
-use unicode_normalization::UnicodeNormalization;
 use std::collections::HashSet;
+use unicode_normalization::UnicodeNormalization;
 
 fn clean_text(s: &str) -> String {
     // Unicode NFC normalization + BOM strip + CRLF -> LF + trim
     let mut t = s.nfc().collect::<String>();
-    if t.starts_with('\u{FEFF}') { // Byte Order Mark
+    if t.starts_with('\u{FEFF}') {
+        // Byte Order Mark
         t.remove(0);
     }
     if t.contains("\r\n") {
@@ -40,14 +41,17 @@ pub fn normalize_chat(mut req: ChatRequest) -> ChatRequest {
             req.stop_sequences = None;
         }
     }
-    if let Some(max) = req.max_output_tokens {
-        if max > 100_000 { req.max_output_tokens = Some(100_000); }
+    if let Some(max) = req.max_output_tokens
+        && max > 100_000
+    {
+        req.max_output_tokens = Some(100_000);
     }
     req
 }
 
 pub fn normalize_embed(mut req: EmbedRequest) -> EmbedRequest {
-    req.inputs = req.inputs
+    req.inputs = req
+        .inputs
         .into_iter()
         .map(|s| clean_text(&s))
         .filter(|s| !s.is_empty())
@@ -67,13 +71,16 @@ mod tests {
             model: "gpt-4o".to_string(),
             messages: msgs
                 .into_iter()
-                .map(|(role, content)| ChatMessage { role: match role {
-                    "user" => Role::User,
-                    "assistant" => Role::Assistant,
-                    "system" => Role::System,
-                    "tool" => Role::Tool,
-                    _ => Role::User,
-                }, content: content.to_string() })
+                .map(|(role, content)| ChatMessage {
+                    role: match role {
+                        "user" => Role::User,
+                        "assistant" => Role::Assistant,
+                        "system" => Role::System,
+                        "tool" => Role::Tool,
+                        _ => Role::User,
+                    },
+                    content: content.to_string(),
+                })
                 .collect(),
             temperature: None,
             top_p: None,
@@ -103,7 +110,12 @@ mod tests {
         let out = normalize_chat(req);
         assert_eq!(out.stop_sequences.as_ref().unwrap().len(), 2);
         assert!(out.stop_sequences.as_ref().unwrap().contains(&"END".into()));
-        assert!(out.stop_sequences.as_ref().unwrap().contains(&"STOP".into()));
+        assert!(
+            out.stop_sequences
+                .as_ref()
+                .unwrap()
+                .contains(&"STOP".into())
+        );
     }
 
     #[test]
@@ -150,7 +162,13 @@ mod tests {
     fn dedup_embedding_inputs_after_clean() {
         let req = EmbedRequest {
             model: "text-embedding-3-small".to_string(),
-            inputs: vec![" a ".into(), "a".into(), "a".into(), "b".into(), " b".into()],
+            inputs: vec![
+                " a ".into(),
+                "a".into(),
+                "a".into(),
+                "b".into(),
+                " b".into(),
+            ],
             client_key: None,
         };
         let out = normalize_embed(req);
