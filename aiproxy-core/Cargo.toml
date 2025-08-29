@@ -11,6 +11,8 @@ toml = "0.8"
 tempfile = { version = "3", optional = true }
 thiserror = "1"
 unicode-normalization = "0.1"
+async-trait = "0.1.89"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "test-util"] }
 
 [dev-dependencies]
 tempfile = "3"
