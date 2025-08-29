@@ -3,3 +3,4 @@ members = [
   "aiproxy-core",
   "aiproxy-bin"
 ]
+resolver = "3"
