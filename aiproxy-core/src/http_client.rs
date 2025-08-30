@@ -29,7 +29,7 @@ pub struct RequestCtx<'a> {
 }
 
 /// Thin wrapper around reqwest::Client with defaults and helpers.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct HttpClient {
     inner: Client,
     user_agent: String,
