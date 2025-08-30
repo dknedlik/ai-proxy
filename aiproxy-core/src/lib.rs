@@ -7,3 +7,4 @@ pub mod provider;
 pub mod provider_factory;
 pub mod providers;
 pub mod router;
+pub mod stream;

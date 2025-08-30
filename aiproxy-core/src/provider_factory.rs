@@ -103,13 +103,7 @@ impl ProviderRegistry {
                 }
             } else {
                 let http = crate::http_client::HttpClient::new_default()?;
-                let openai = Arc::new(OpenAI::new(
-                    http,
-                    api_key,
-                    base,
-                    org,
-                    project,
-                ));
+                let openai = Arc::new(OpenAI::new(http, api_key, base, org, project));
 
                 chat.insert("openai".to_string(), openai.clone());
                 embed.insert("openai".to_string(), openai.clone());
