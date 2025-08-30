@@ -1,3 +1,13 @@
+// SSE buffer growth guard: 2 MiB
+const MAX_SSE_BUFFER: usize = 2 * 1024 * 1024;
+
+// DRY helper to apply request-context headers.
+fn apply_ctx_headers(mut req: reqwest::RequestBuilder, ctx: &RequestCtx<'_>) -> reqwest::RequestBuilder {
+    if let Some(rid) = ctx.request_id { req = req.header("X-Request-Id", rid); }
+    if let Some(tid) = ctx.turn_id { req = req.header("X-Turn-Id", tid); }
+    if let Some(ik) = ctx.idempotency_key { req = req.header("Idempotency-Key", ik); }
+    req
+}
 use std::time::Instant;
 
 use reqwest::{Client, StatusCode};
@@ -57,20 +67,11 @@ impl HttpClient {
             .post(url)
             .json(body)
             .header("User-Agent", &self.user_agent);
-
         // custom headers
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        if let Some(rid) = ctx.request_id {
-            req = req.header("X-Request-Id", rid);
-        }
-        if let Some(tid) = ctx.turn_id {
-            req = req.header("X-Turn-Id", tid);
-        }
-        if let Some(ik) = ctx.idempotency_key {
-            req = req.header("Idempotency-Key", ik);
-        }
+        req = apply_ctx_headers(req, ctx);
 
         let resp = req
             .send()
@@ -79,7 +80,6 @@ impl HttpClient {
                 provider: "http".into(),
             })?;
 
-        let latency = start.elapsed().as_millis() as u32;
         let status = resp.status();
         let headers = resp.headers().clone();
         let provider_request_id = extract_request_id(&headers);
@@ -87,17 +87,45 @@ impl HttpClient {
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             let ra = parse_retry_after(&headers);
+            let latency = start.elapsed().as_millis() as u32;
+            // Telemetry: HTTP error
+            {
+                let trace = crate::telemetry::ProviderTrace::new()
+                    .provider("http")
+                    .latency_ms(latency as u64)
+                    .provider_request_id_opt(provider_request_id.as_deref())
+                    .error_kind("http_error")
+                    .error_message(&truncate(&text, 200));
+                crate::telemetry::emit(trace);
+            }
             return Err(map_http_error("http", status, ra, &text));
         }
 
-        let parsed = resp
-            .json::<R>()
-            .await
-            .map_err(|e| AiProxyError::ProviderError {
+        let parsed = resp.json::<R>().await.map_err(|e| {
+            let latency = start.elapsed().as_millis() as u32;
+            // Telemetry: decode error
+            let trace = crate::telemetry::ProviderTrace::new()
+                .provider("http")
+                .latency_ms(latency as u64)
+                .provider_request_id_opt(provider_request_id.as_deref())
+                .error_kind("decode_error")
+                .error_message(&format!("json decode error: {e}"));
+            crate::telemetry::emit(trace);
+            AiProxyError::ProviderError {
                 provider: "http".into(),
                 code: status.as_u16().to_string(),
                 message: format!("json decode error: {e}"),
-            })?;
+            }
+        })?;
+        let latency = start.elapsed().as_millis() as u32;
+        // Telemetry: success
+        {
+            let trace = crate::telemetry::ProviderTrace::new()
+                .provider("http")
+                .latency_ms(latency as u64)
+                .provider_request_id_opt(provider_request_id.as_deref());
+            crate::telemetry::emit(trace);
+        }
         Ok((parsed, provider_request_id, latency))
     }
 
@@ -112,25 +140,17 @@ impl HttpClient {
     ) -> CoreResult<SseStream> {
 
         // Build request
+        let start = Instant::now();
         let mut req = self
             .inner
             .post(url)
             .json(body)
             .header("User-Agent", &self.user_agent)
             .header("Accept", "text/event-stream");
-
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        if let Some(rid) = ctx.request_id {
-            req = req.header("X-Request-Id", rid);
-        }
-        if let Some(tid) = ctx.turn_id {
-            req = req.header("X-Turn-Id", tid);
-        }
-        if let Some(ik) = ctx.idempotency_key {
-            req = req.header("Idempotency-Key", ik);
-        }
+        req = apply_ctx_headers(req, ctx);
 
         let resp = req.send().await.map_err(|_| AiProxyError::ProviderUnavailable {
             provider: "http".into(),
@@ -141,13 +161,31 @@ impl HttpClient {
             let headers = resp.headers().clone();
             let ra = parse_retry_after(&headers);
             let body = resp.text().await.unwrap_or_default();
+            let latency = start.elapsed().as_millis() as u64;
+            // Telemetry: HTTP error
+            {
+                let trace = crate::telemetry::ProviderTrace::new()
+                    .provider("http")
+                    .latency_ms(latency)
+                    .provider_request_id_opt(extract_request_id(&headers).as_deref())
+                    .error_kind("http_error")
+                    .error_message(&truncate(&body, 200));
+                crate::telemetry::emit(trace);
+            }
             return Err(map_http_error("http", status, ra, &body));
         }
 
         // Stream body as bytes and split on '\n'
+        let provider_request_id = extract_request_id(resp.headers());
         let byte_stream = resp.bytes_stream();
         let line_stream = LineStream::new(Box::pin(byte_stream));
-        Ok(Box::pin(line_stream))
+        let wrapped = TelemetryOnDrop {
+            inner: Box::pin(line_stream),
+            start,
+            provider_request_id,
+            emitted: false,
+        };
+        Ok(Box::pin(wrapped))
     }
 
     pub async fn get_json<R: DeserializeOwned>(
@@ -159,16 +197,13 @@ impl HttpClient {
         let start = Instant::now();
         let mut req = self.inner.get(url).header("User-Agent", &self.user_agent);
         for (k, v) in headers { req = req.header(*k, *v); }
-        if let Some(rid) = ctx.request_id { req = req.header("X-Request-Id", rid); }
-        if let Some(tid) = ctx.turn_id { req = req.header("X-Turn-Id", tid); }
-        if let Some(ik) = ctx.idempotency_key { req = req.header("Idempotency-Key", ik); }
+        req = apply_ctx_headers(req, ctx);
 
         let resp = req
             .send()
             .await
             .map_err(|_e| AiProxyError::ProviderUnavailable { provider: "http".into() })?;
 
-        let latency = start.elapsed().as_millis() as u32;
         let status = resp.status();
         let headers = resp.headers().clone();
         let provider_request_id = extract_request_id(&headers);
@@ -176,14 +211,45 @@ impl HttpClient {
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             let ra = parse_retry_after(&headers);
+            let latency = start.elapsed().as_millis() as u32;
+            // Telemetry: HTTP error
+            {
+                let trace = crate::telemetry::ProviderTrace::new()
+                    .provider("http")
+                    .latency_ms(latency as u64)
+                    .provider_request_id_opt(provider_request_id.as_deref())
+                    .error_kind("http_error")
+                    .error_message(&truncate(&text, 200));
+                crate::telemetry::emit(trace);
+            }
             return Err(map_http_error("http", status, ra, &text));
         }
 
-        let parsed = resp.json::<R>().await.map_err(|e| AiProxyError::ProviderError {
-            provider: "http".into(),
-            code: status.as_u16().to_string(),
-            message: format!("json decode error: {e}"),
+        let parsed = resp.json::<R>().await.map_err(|e| {
+            let latency = start.elapsed().as_millis() as u32;
+            // Telemetry: decode error
+            let trace = crate::telemetry::ProviderTrace::new()
+                .provider("http")
+                .latency_ms(latency as u64)
+                .provider_request_id_opt(provider_request_id.as_deref())
+                .error_kind("decode_error")
+                .error_message(&format!("json decode error: {e}"));
+            crate::telemetry::emit(trace);
+            AiProxyError::ProviderError {
+                provider: "http".into(),
+                code: status.as_u16().to_string(),
+                message: format!("json decode error: {e}"),
+            }
         })?;
+        let latency = start.elapsed().as_millis() as u32;
+        // Telemetry: success
+        {
+            let trace = crate::telemetry::ProviderTrace::new()
+                .provider("http")
+                .latency_ms(latency as u64)
+                .provider_request_id_opt(provider_request_id.as_deref());
+            crate::telemetry::emit(trace);
+        }
         Ok((parsed, provider_request_id, latency))
     }
 }
@@ -295,6 +361,13 @@ impl futures_util::stream::Stream for LineStream {
                 Poll::Ready(Some(Ok(chunk))) => {
                     let s = String::from_utf8_lossy(&chunk);
                     self.buf.push_str(&s);
+                    if self.buf.len() > MAX_SSE_BUFFER {
+                        return Poll::Ready(Some(Err(AiProxyError::ProviderError {
+                            provider: "http".into(),
+                            code: "sse_buffer_overflow".into(),
+                            message: "SSE buffer exceeded 2MiB without a newline".into(),
+                        })));
+                    }
                     continue;
                 }
                 Poll::Ready(Some(Err(_e))) => {
@@ -317,15 +390,85 @@ impl futures_util::stream::Stream for LineStream {
     }
 }
 
+/// Adapter that emits a single telemetry record when the inner stream completes or is dropped.
+struct TelemetryOnDrop<S> {
+    inner: std::pin::Pin<Box<S>>, // keep pinned
+    start: Instant,
+    provider_request_id: Option<String>,
+    emitted: bool,
+}
+
+impl<S> futures_util::stream::Stream for TelemetryOnDrop<S>
+where
+    S: futures_util::stream::Stream<Item = CoreResult<SseLine>> + Unpin,
+{
+    type Item = CoreResult<SseLine>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(None) => {
+                if !self.emitted {
+                    self.emitted = true;
+                    let latency = self.start.elapsed().as_millis() as u64;
+                    let trace = crate::telemetry::ProviderTrace::new()
+                        .provider("http")
+                        .latency_ms(latency)
+                        .provider_request_id_opt(self.provider_request_id.as_deref());
+                    crate::telemetry::emit(trace);
+                }
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Ready(Some(item)) => std::task::Poll::Ready(Some(item)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl<S> Drop for TelemetryOnDrop<S> {
+    fn drop(&mut self) {
+        if !self.emitted {
+            self.emitted = true;
+            let latency = self.start.elapsed().as_millis() as u64;
+            let trace = crate::telemetry::ProviderTrace::new()
+                .provider("http")
+                .latency_ms(latency)
+                .provider_request_id_opt(self.provider_request_id.as_deref());
+            crate::telemetry::emit(trace);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use httpmock::Method::POST;
     use httpmock::MockServer;
     use serde_json::json;
+    use std::sync::Mutex;
+
+    // ---- Test telemetry sink ----
+    struct TestSink;
+    impl crate::telemetry::TelemetrySink for TestSink {
+        fn record(&self, trace: crate::telemetry::ProviderTrace) {
+            TRACES.lock().unwrap_or_else(|e| e.into_inner()).push(trace);
+        }
+    }
+    static TRACES: once_cell::sync::Lazy<Mutex<Vec<crate::telemetry::ProviderTrace>>> =
+        once_cell::sync::Lazy::new(|| Mutex::new(Vec::new()));
+
+    fn ensure_sink_installed() {
+        use std::sync::Arc;
+        let _ = crate::telemetry::set_telemetry_sink(Arc::new(TestSink));
+        crate::telemetry::test_set_capture_enabled(true);
+        TRACES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
 
     #[tokio::test]
     async fn post_json_success() {
+        ensure_sink_installed();
         let server = MockServer::start();
         let m = server.mock(|when, then| {
             when.method(POST).path("/chat");
@@ -359,6 +502,14 @@ mod tests {
         assert_eq!(provider_id, Some("abc123".into()));
         assert!(latency > 0);
         m.assert();
+
+        // Telemetry assertion
+        let traces = TRACES.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!traces.is_empty());
+        let hit = traces.iter().rev().find(|t| t.provider.as_deref() == Some("http") && t.provider_request_id.as_deref() == Some("abc123"));
+        assert!(hit.is_some(), "telemetry record with provider_request_id=abc123 not found; have: {:?}", *traces);
+        let hit = hit.unwrap();
+        assert!(hit.latency_ms.unwrap_or(0) > 0);
     }
 
     #[tokio::test]
@@ -401,6 +552,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_json_503_maps_to_unavailable() {
+        ensure_sink_installed();
         let server = MockServer::start();
         let _m = server.mock(|when, then| {
             when.method(POST).path("/chat");
@@ -423,6 +575,14 @@ mod tests {
             .unwrap_err();
 
         matches!(err, AiProxyError::ProviderUnavailable { .. });
+
+        // Telemetry assertion
+        let traces = TRACES.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!traces.is_empty());
+        let hit = traces.iter().rev().find(|t| t.provider.as_deref() == Some("http") && t.error_kind.as_deref() == Some("http_error"));
+        assert!(hit.is_some(), "telemetry record with http_error not found; have: {:?}", *traces);
+        let hit = hit.unwrap();
+        assert!(hit.latency_ms.unwrap_or(0) > 0);
     }
 
     #[tokio::test]
@@ -481,5 +641,40 @@ mod tests {
             &ctx,
         ).await.unwrap_err();
         assert!(matches!(err, AiProxyError::ProviderUnavailable { .. }));
+    }
+
+    #[tokio::test]
+    async fn post_sse_lines_emits_telemetry_on_completion() {
+        ensure_sink_installed();
+        let server = MockServer::start();
+        // Simulate SSE with two chunks then DONE
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n\
+data: [DONE]\n\n";
+        let _m = server.mock(|when, then| {
+            when.method(POST).path("/sse");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .header("x-request-id", "sse123")
+                .body(sse_body);
+        });
+        let client = HttpClient::new_default().expect("client");
+        let ctx = RequestCtx::default();
+        let mut stream = client.post_sse_lines(
+            &format!("{}/sse", server.base_url()),
+            &serde_json::json!({"stream": true}),
+            &[],
+            &ctx,
+        ).await.expect("sse ok");
+
+        use futures_util::StreamExt;
+        while let Some(_line) = stream.next().await { /* drain */ }
+
+        let traces = TRACES.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!traces.is_empty());
+        let last = traces.last().unwrap();
+        assert_eq!(last.provider.as_deref(), Some("http"));
+        assert!(last.latency_ms.unwrap_or(0) > 0);
+        // provider_request_id should be captured
+        assert_eq!(last.provider_request_id.as_deref(), Some("sse123"));
     }
 }

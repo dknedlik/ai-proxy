@@ -29,6 +29,10 @@ pub struct ProviderTrace {
 
     /// Finish reason as a normalized string (e.g., "Stop", "Length", "Error").
     pub finish_reason: Option<String>,
+
+    /// Optional error metadata, if applicable.
+    pub error_kind: Option<String>,
+    pub error_message: Option<String>,
 }
 
 impl ProviderTrace {
@@ -71,6 +75,47 @@ impl ProviderTrace {
         self.latency_ms = Some(ms);
         self
     }
+
+    // Shorthand fluent setters used by instrumentation
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn provider(mut self, provider: &str) -> Self {
+        self.provider = Some(provider.to_string());
+        self
+    }
+    pub fn model(mut self, model: &str) -> Self {
+        self.model = Some(model.to_string());
+        self
+    }
+    pub fn request_id_opt(mut self, rid: Option<&str>) -> Self {
+        self.request_id = rid.map(|s| s.to_string());
+        self
+    }
+    pub fn turn_id_opt(mut self, tid: Option<&str>) -> Self {
+        self.turn_id = tid.map(|s| s.to_string());
+        self
+    }
+    pub fn provider_request_id_opt<S: AsRef<str>>(mut self, prid: Option<S>) -> Self {
+        self.provider_request_id = prid.map(|s| s.as_ref().to_string());
+        self
+    }
+    pub fn latency_ms(mut self, ms: u64) -> Self {
+        self.latency_ms = Some(ms as u128);
+        self
+    }
+    pub fn finish_reason_opt(mut self, reason: Option<&str>) -> Self {
+        self.finish_reason = reason.map(|s| s.to_string());
+        self
+    }
+    pub fn error_kind(mut self, kind: &str) -> Self {
+        self.error_kind = Some(kind.to_string());
+        self
+    }
+    pub fn error_message(mut self, msg: &str) -> Self {
+        self.error_message = Some(msg.to_string());
+        self
+    }
 }
 
 #[cfg(test)]
@@ -97,4 +142,3 @@ mod tests {
         assert_eq!(as_json["finish_reason"], json!("Stop"));
     }
 }
-

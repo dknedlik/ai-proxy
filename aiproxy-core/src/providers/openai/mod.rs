@@ -1010,6 +1010,9 @@ impl OpenAI {
         F: FnMut(&str) + Send,
         G: FnMut(Option<StopReason>) + Send,
     {
+        use std::time::Instant;
+        use std::sync::{Arc, Mutex};
+        let started = Instant::now();
         // Build payload with stream=true
         let payload = OAChatReq {
             model: &req.model,
@@ -1037,7 +1040,29 @@ impl OpenAI {
             .post_sse_lines(&url, &payload, &hdrs, &ctx)
             .await?;
 
-        Self::drive_openai_sse(sse, on_text_delta, on_stop).await
+        // Wrap stop callback to capture finish reason for telemetry
+        let finish_shared: Arc<Mutex<Option<StopReason>>> = Arc::new(Mutex::new(None));
+        let mut user_on_stop = on_stop;
+        let finish_clone = finish_shared.clone();
+        let wrapped_stop = move |reason: Option<StopReason>| {
+            *finish_clone.lock().unwrap() = reason;
+            user_on_stop(reason);
+        };
+
+        let res = Self::drive_openai_sse(sse, on_text_delta, wrapped_stop).await;
+
+        // Emit provider-level telemetry
+        let fr_str = finish_shared.lock().unwrap().map(stop_to_string);
+        let trace = crate::telemetry::ProviderTrace::new()
+            .provider("openai")
+            .model(&req.model)
+            .turn_id_opt(req.trace_id.as_deref())
+            .request_id_opt(req.request_id.as_deref())
+            .finish_reason_opt(fr_str.as_deref())
+            .latency_ms(started.elapsed().as_millis() as u64);
+        crate::telemetry::emit(trace);
+
+        res
     }
 
     // Internal helper to drive an SSE line stream and invoke callbacks.
@@ -1087,5 +1112,16 @@ impl OpenAI {
             on_stop(None);
         }
         Ok(())
+    }
+}
+
+fn stop_to_string(s: StopReason) -> String {
+    match s {
+        StopReason::Stop => "Stop".into(),
+        StopReason::Length => "Length".into(),
+        StopReason::ToolUse => "ToolUse".into(),
+        StopReason::EndTurn => "EndTurn".into(),
+        StopReason::ContentFilter => "ContentFilter".into(),
+        StopReason::Other => "Other".into(),
     }
 }
