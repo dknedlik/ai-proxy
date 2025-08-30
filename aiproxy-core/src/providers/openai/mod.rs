@@ -9,23 +9,32 @@ use crate::model::{
     ChatMessage, ChatRequest, ChatResponse, EmbedRequest, EmbedResponse, StopReason,
 };
 use crate::provider::{Capability, ChatProvider, EmbedProvider, ProviderCaps};
+use secrecy::{ExposeSecret, SecretString};
 
 #[derive(Debug, Clone)]
 pub struct OpenAI {
     http: HttpClient,
     base: String,
     org: Option<String>,
+    project: Option<String>,
     name: String, // usually "openai"
-    api_key: String,
+    api_key: SecretString,
 }
 
 impl OpenAI {
-    pub fn new(http: HttpClient, api_key: String, base: String, org: Option<String>) -> Self {
+    pub fn new(
+        http: HttpClient,
+        api_key: SecretString,
+        base: String,
+        org: Option<String>,
+        project: Option<String>,
+    ) -> Self {
         Self {
             http,
             api_key,
             base,
             org,
+            project,
             name: "openai".into(),
         }
     }
@@ -34,22 +43,23 @@ impl OpenAI {
     pub fn new_for_tests(server_base: &str) -> Self {
         OpenAI::new(
             HttpClient::new_default().unwrap(),
-            "test-key".into(),
+            SecretString::new("test-key".into()),
             server_base.to_string(),
+            None,
             None,
         )
     }
 
     fn headers(&self, _ctx: &RequestCtx<'_>) -> Vec<(String, String)> {
-        let mut h = vec![
-            (
-                "Authorization".to_string(),
-                format!("Bearer {}", self.api_key),
-            ),
-            ("Content-Type".to_string(), "application/json".to_string()),
-        ];
+        let mut h = vec![(
+            "Authorization".to_string(),
+            format!("Bearer {}", self.api_key.expose_secret()),
+        )];
         if let Some(org) = &self.org {
             h.push(("OpenAI-Organization".into(), org.clone()));
+        }
+        if let Some(project) = &self.project {
+            h.push(("OpenAI-Project".into(), project.clone()));
         }
         h
     }
@@ -134,6 +144,26 @@ impl ChatProvider for OpenAI {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         let url = format!("{}/v1/chat/completions", self.base);
+        if std::env::var("AIPROXY_DEBUG_HTTP").ok().as_deref() == Some("1") {
+            eprintln!("CHAT url: {}", url);
+            for (k, v) in &hdrs {
+                if k.eq_ignore_ascii_case("authorization") && v.starts_with("Bearer ") {
+                    let raw = &v["Bearer ".len()..];
+                    let masked = if raw.len() > 10 {
+                        format!("Bearer {}****{}", &raw[..6], &raw[raw.len() - 4..])
+                    } else {
+                        "Bearer ****".to_string()
+                    };
+                    eprintln!("CHAT header: {}: {}", k, masked);
+                } else {
+                    eprintln!("CHAT header: {}: {}", k, v);
+                }
+            }
+            eprintln!(
+                "CHAT payload: {}",
+                serde_json::to_string(&payload).unwrap_or_default()
+            );
+        }
         let (resp, provider_id, latency_ms) = self
             .http
             .post_json::<_, OAChatResp>(&url, &payload, &hdrs, &ctx)
@@ -141,12 +171,12 @@ impl ChatProvider for OpenAI {
 
         let text = resp
             .choices
-            .get(0)
+            .first()
             .map(|c| c.message.content.clone())
             .unwrap_or_default();
         let stop_reason = resp
             .choices
-            .get(0)
+            .first()
             .and_then(|c| map_finish(c.finish_reason.as_deref()));
         let (usage_p, usage_c) = resp
             .usage
@@ -171,9 +201,15 @@ impl ChatProvider for OpenAI {
 }
 
 #[derive(Serialize)]
+#[serde(untagged)]
+enum OAInput<'a> {
+    Many(&'a [String]),
+}
+
+#[derive(Serialize)]
 struct OAEmbedReq<'a> {
     model: &'a str,
-    input: &'a [String],
+    input: OAInput<'a>,
 }
 
 #[derive(Deserialize)]
@@ -193,9 +229,10 @@ impl EmbedProvider for OpenAI {
     }
 
     async fn embed(&self, req: EmbedRequest) -> CoreResult<EmbedResponse> {
+        // Always send array form for maximum compatibility
         let payload = OAEmbedReq {
             model: &req.model,
-            input: &req.inputs,
+            input: OAInput::Many(&req.inputs),
         };
         let ctx = RequestCtx {
             request_id: None,
@@ -208,6 +245,26 @@ impl EmbedProvider for OpenAI {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         let url = format!("{}/v1/embeddings", self.base);
+        if std::env::var("AIPROXY_DEBUG_HTTP").ok().as_deref() == Some("1") {
+            eprintln!("EMBED url: {}", url);
+            for (k, v) in &hdrs {
+                if k.eq_ignore_ascii_case("authorization") && v.starts_with("Bearer ") {
+                    let raw = &v["Bearer ".len()..];
+                    let masked = if raw.len() > 10 {
+                        format!("Bearer {}****{}", &raw[..6], &raw[raw.len() - 4..])
+                    } else {
+                        "Bearer ****".to_string()
+                    };
+                    eprintln!("EMBED header: {}: {}", k, masked);
+                } else {
+                    eprintln!("EMBED header: {}: {}", k, v);
+                }
+            }
+            eprintln!(
+                "EMBED payload: {}",
+                serde_json::to_string(&payload).unwrap_or_default()
+            );
+        }
         let (resp, _provider_id, _lat) = self
             .http
             .post_json::<_, OAEmbedResp>(&url, &payload, &hdrs, &ctx)
@@ -227,6 +284,33 @@ impl ProviderCaps for OpenAI {
     fn capabilities(&self) -> &'static [Capability] {
         &[Capability::Chat, Capability::Embed]
     }
+}
+
+#[tokio::test]
+async fn embed_posts_model_and_input_shape() {
+    use httpmock::prelude::*;
+
+    let server = MockServer::start();
+    let provider = OpenAI::new_for_tests(&server.base_url());
+
+    let m = server.mock(|when, then| {
+        when.method(POST)
+            .path("/v1/embeddings")
+            .body_contains("\"model\":\"text-embedding-3-small\"")
+            .body_contains("\"input\"");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{ "data": [ { "embedding": [0.1, 0.2] } ] }"#);
+    });
+
+    let req = EmbedRequest {
+        model: "text-embedding-3-small".into(),
+        inputs: vec!["hello".into()],
+        client_key: None,
+    };
+    let _ = provider.embed(req).await.expect("embed ok");
+
+    m.assert();
 }
 
 #[cfg(test)]

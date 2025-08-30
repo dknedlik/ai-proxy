@@ -82,7 +82,8 @@ impl RoutingResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CacheCfg, FsyncPolicy, Providers, RoutingCfg, TranscriptCfg};
+    use crate::config::{CacheCfg, FsyncPolicy, HttpCfg, Providers, RoutingCfg, TranscriptCfg};
+    use secrecy::SecretString;
 
     fn cfg_with_rules(default: &str, rules: Vec<(&str, &str)>) -> Config {
         let compiled_rules = rules
@@ -112,6 +113,7 @@ mod tests {
                 default: default.into(),
                 rules: compiled_rules,
             },
+            http: HttpCfg::default(),
         }
     }
 
@@ -211,9 +213,10 @@ mod tests {
         let http = crate::http_client::HttpClient::new_default().expect("http");
         let oi = std::sync::Arc::new(OpenAI::new(
             http,
-            "test-key".into(),
+            SecretString::new("test-key".into()),
             server.base_url(),
-            None,
+            None, // org
+            None, // project
         ));
         let reg = ProviderRegistry::with_openai_for_tests(oi);
 

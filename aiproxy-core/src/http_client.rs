@@ -1,3 +1,4 @@
+use crate::config::HttpCfg;
 use std::time::Instant;
 
 use reqwest::{Client, StatusCode};
@@ -36,17 +37,25 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
-    pub fn new_default() -> CoreResult<Self> {
-        let inner = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(60))
-            .pool_max_idle_per_host(8)
+    pub fn new_with(cfg: &HttpCfg) -> CoreResult<Self> {
+        let mut builder = Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(cfg.connect_timeout_ms))
+            .timeout(std::time::Duration::from_millis(cfg.request_timeout_ms));
+        if let Some(n) = cfg.pool_max_idle_per_host {
+            builder = builder.pool_max_idle_per_host(n);
+        }
+        let inner = builder
             .build()
             .map_err(|e| AiProxyError::Other(anyhow::anyhow!("http client build failed: {e}")))?;
         Ok(Self {
             inner,
-            user_agent: format!("ai-proxy/0.1"),
+            user_agent: "ai-proxy/0.1".to_string(),
         })
+    }
+
+    pub fn new_default() -> CoreResult<Self> {
+        let cfg = HttpCfg::default();
+        Self::new_with(&cfg)
     }
 
     pub async fn post_json<T: Serialize, R: DeserializeOwned>(
@@ -79,6 +88,47 @@ impl HttpClient {
                 req = req.header("Idempotency-Key", ik);
             }
             req = req.header("X-Retry-Attempt", attempt.to_string());
+
+            // Add Accept header for compatibility
+            req = req.header("Accept", "application/json");
+
+            // If debug level 2, print a runnable curl command with exact headers/body
+            if std::env::var("AIPROXY_DEBUG_HTTP").ok().as_deref() == Some("2") {
+                let mut curl = format!("curl -i '{}' \\\n  -X POST", url);
+                // Headers we explicitly set
+                curl.push_str(&format!(" \\\n  -H 'User-Agent: {}'", self.user_agent));
+                curl.push_str(" \\\n  -H 'Content-Type: application/json'");
+                curl.push_str(" \\\n  -H 'Accept: application/json'");
+                // Custom headers (mask sensitive)
+                for (k, v) in headers {
+                    if k.eq_ignore_ascii_case("authorization") && v.starts_with("Bearer ") {
+                        let raw = &v["Bearer ".len()..];
+                        let masked = if raw.len() > 10 {
+                            format!("Bearer {}****{}", &raw[..6], &raw[raw.len() - 4..])
+                        } else {
+                            "Bearer ****".to_string()
+                        };
+                        curl.push_str(&format!(" \\\n  -H '{}: {}'", k, masked));
+                    } else {
+                        curl.push_str(&format!(" \\\n  -H '{}: {}'", k, v));
+                    }
+                }
+                if let Some(rid) = ctx.request_id {
+                    curl.push_str(&format!(" \\\n  -H 'X-Request-Id: {}'", rid));
+                }
+                if let Some(tid) = ctx.turn_id {
+                    curl.push_str(&format!(" \\\n  -H 'X-Turn-Id: {}'", tid));
+                }
+                if let Some(ik) = ctx.idempotency_key {
+                    curl.push_str(&format!(" \\\n  -H 'Idempotency-Key: {}'", ik));
+                }
+                curl.push_str(&format!(" \\\n  -H 'X-Retry-Attempt: {}'", attempt));
+                let body_str =
+                    serde_json::to_string(body).unwrap_or_else(|_| "<SERDE_ERROR>".into());
+                let escaped = body_str.replace('\'', "'\\''");
+                curl.push_str(&format!(" \\\n  -d '{}'", escaped));
+                eprintln!("[curl] {}", curl);
+            }
 
             let resp = match req.send().await {
                 Ok(r) => r,
@@ -160,6 +210,39 @@ impl HttpClient {
             }
             req = req.header("X-Retry-Attempt", attempt.to_string());
 
+            // Add Accept for GETs too
+            req = req.header("Accept", "application/json");
+
+            if std::env::var("AIPROXY_DEBUG_HTTP").ok().as_deref() == Some("2") {
+                let mut curl = format!("curl -i '{}' \\\n  -X GET", url);
+                curl.push_str(&format!(" \\\n  -H 'User-Agent: {}'", self.user_agent));
+                curl.push_str(" \\\n  -H 'Accept: application/json'");
+                for (k, v) in headers {
+                    if k.eq_ignore_ascii_case("authorization") && v.starts_with("Bearer ") {
+                        let raw = &v["Bearer ".len()..];
+                        let masked = if raw.len() > 10 {
+                            format!("Bearer {}****{}", &raw[..6], &raw[raw.len() - 4..])
+                        } else {
+                            "Bearer ****".to_string()
+                        };
+                        curl.push_str(&format!(" \\\n  -H '{}: {}'", k, masked));
+                    } else {
+                        curl.push_str(&format!(" \\\n  -H '{}: {}'", k, v));
+                    }
+                }
+                if let Some(rid) = ctx.request_id {
+                    curl.push_str(&format!(" \\\n  -H 'X-Request-Id: {}'", rid));
+                }
+                if let Some(tid) = ctx.turn_id {
+                    curl.push_str(&format!(" \\\n  -H 'X-Turn-Id: {}'", tid));
+                }
+                if let Some(ik) = ctx.idempotency_key {
+                    curl.push_str(&format!(" \\\n  -H 'Idempotency-Key: {}'", ik));
+                }
+                curl.push_str(&format!(" \\\n  -H 'X-Retry-Attempt: {}'", attempt));
+                eprintln!("[curl] {}", curl);
+            }
+
             let resp = match req.send().await {
                 Ok(r) => r,
                 Err(_e) => {
@@ -224,25 +307,24 @@ fn extract_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
         "x-cdn-request-id",
     ];
     for k in CANDIDATES {
-        if let Some(v) = headers.get(k) {
-            if let Ok(s) = v.to_str() {
-                return Some(s.to_string());
-            }
+        if let Some(v) = headers.get(k)
+            && let Ok(s) = v.to_str()
+        {
+            return Some(s.to_string());
         }
     }
     None
 }
 
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    if let Some(v) = headers.get("retry-after") {
-        if let Ok(s) = v.to_str() {
-            if let Ok(secs) = s.trim().parse::<u64>() {
-                return Some(secs);
-            }
-            // HTTP-date parsing (RFC 7231) best-effort using httpdate crate if added later.
-            // For now, ignore non-numeric forms.
-        }
+    if let Some(v) = headers.get("retry-after")
+        && let Ok(s) = v.to_str()
+        && let Ok(secs) = s.trim().parse::<u64>()
+    {
+        return Some(secs);
     }
+    // HTTP-date parsing (RFC 7231) best-effort using httpdate crate if added later.
+    // For now, ignore non-numeric forms.
     None
 }
 
@@ -284,6 +366,18 @@ mod tests {
     use httpmock::Method::POST;
     use httpmock::MockServer;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn new_with_applies_timeouts() {
+        use crate::config::HttpCfg;
+        let cfg = HttpCfg {
+            connect_timeout_ms: 1234,
+            request_timeout_ms: 5678,
+            pool_max_idle_per_host: Some(2),
+        };
+        let client = HttpClient::new_with(&cfg).expect("client");
+        assert_eq!(client.user_agent, "ai-proxy/0.1");
+    }
 
     #[tokio::test]
     async fn post_json_success() {

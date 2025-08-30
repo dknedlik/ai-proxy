@@ -47,6 +47,36 @@ pub struct TranscriptCfg {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct HttpCfg {
+    /// TCP connect timeout in milliseconds (default 5000ms)
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// Total request timeout in milliseconds (default 60000ms)
+    #[serde(default = "default_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+    /// Optional per-host idle connection pool cap (None = reqwest default)
+    #[serde(default)]
+    pub pool_max_idle_per_host: Option<usize>,
+}
+
+impl Default for HttpCfg {
+    fn default() -> Self {
+        Self {
+            connect_timeout_ms: default_connect_timeout_ms(),
+            request_timeout_ms: default_request_timeout_ms(),
+            pool_max_idle_per_host: None,
+        }
+    }
+}
+
+fn default_connect_timeout_ms() -> u64 {
+    5_000
+}
+fn default_request_timeout_ms() -> u64 {
+    60_000
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct RoutingRule {
     /// Regex applied to the model name, e.g. ^gpt-.*
     pub model: String,
@@ -67,6 +97,9 @@ pub struct Config {
     pub cache: CacheCfg,
     pub transcript: TranscriptCfg,
     pub routing: RoutingCfg,
+    /// HTTP client configuration (timeouts, pooling). Missing in older configs → defaults.
+    #[serde(default)]
+    pub http: HttpCfg,
 }
 
 impl Config {
@@ -124,6 +157,9 @@ mod tests {
         assert_eq!(cfg.routing.default, "openai");
         assert_eq!(cfg.transcript.segment_mb, 64);
         assert!(cfg.providers.openai.is_some());
+        assert_eq!(cfg.http.connect_timeout_ms, 5_000);
+        assert_eq!(cfg.http.request_timeout_ms, 60_000);
+        assert_eq!(cfg.http.pool_max_idle_per_host, None);
     }
 
     #[test]
@@ -202,6 +238,9 @@ provider = "anthropic"
         let cfg = Config::from_path(&file).unwrap();
         assert_eq!(cfg.routing.default, "openai");
         assert!(cfg.providers.openai.is_some());
+        assert_eq!(cfg.http.connect_timeout_ms, 5_000);
+        assert_eq!(cfg.http.request_timeout_ms, 60_000);
+        assert_eq!(cfg.http.pool_max_idle_per_host, None);
     }
 
     #[test]
@@ -213,6 +252,9 @@ provider = "anthropic"
         fs::write(&json_path, json).unwrap();
         let cfg_json_first = Config::from_path(&json_path).unwrap();
         assert_eq!(cfg_json_first.routing.default, "openai");
+        assert_eq!(cfg_json_first.http.connect_timeout_ms, 5_000);
+        assert_eq!(cfg_json_first.http.request_timeout_ms, 60_000);
+        assert_eq!(cfg_json_first.http.pool_max_idle_per_host, None);
 
         // Now write TOML to a different .conf and ensure TOML fallback works when JSON fails
         let toml_path = dir.path().join("poc2.conf");
@@ -236,5 +278,8 @@ rules = []
         fs::write(&toml_path, toml).unwrap();
         let cfg_toml_fallback = Config::from_path(&toml_path).unwrap();
         assert_eq!(cfg_toml_fallback.cache.ttl_seconds, 1);
+        assert_eq!(cfg_toml_fallback.http.connect_timeout_ms, 5_000);
+        assert_eq!(cfg_toml_fallback.http.request_timeout_ms, 60_000);
+        assert_eq!(cfg_toml_fallback.http.pool_max_idle_per_host, None);
     }
 }

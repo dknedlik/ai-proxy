@@ -5,3 +5,6 @@ edition = "2024"
 
 [dependencies]
 aiproxy-core = { path = "../aiproxy-core" }
+anyhow = "1.0.99"
+clap = { version = "4.5.46", features = ["derive"] }
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
