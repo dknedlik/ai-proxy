@@ -183,4 +183,55 @@ mod tests {
             .expect("chat provider should be found");
         assert_eq!(chat.name(), "null"); // proves first rule took precedence over later more-specific rule
     }
+
+    #[tokio::test]
+    async fn router_selects_openai_and_calls_chat() {
+        use httpmock::{Method::POST, MockServer};
+        use serde_json::json;
+        use crate::providers::openai::OpenAI;
+
+        // Mock OpenAI server
+        let server = MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(json!({
+                "id": "cmpl_rtr",
+                "choices": [{
+                    "message": {"role":"assistant", "content":"pong"},
+                    "finish_reason": "stop"
+                }]
+            }));
+        });
+
+        // Build a config routing gpt-* to openai
+        let cfg = cfg_with_rules("openai", vec![("^gpt-.*", "openai")]);
+        let router = RoutingResolver::new(&cfg).expect("router");
+
+        // Build registry directly with a test OpenAI pointing to mock server
+        let http = crate::http_client::HttpClient::new_default().expect("http");
+        let oi = std::sync::Arc::new(OpenAI::new(http, "test-key".into(), server.base_url(), None));
+        let reg = ProviderRegistry::with_openai_for_tests(oi);
+
+        let chat = router.select_chat(&reg, "gpt-4o").expect("chat provider");
+        let req = crate::model::ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![crate::model::ChatMessage {
+                role: crate::model::Role::User,
+                content: "ping".into(),
+            }],
+            temperature: None,
+            top_p: None,
+            metadata: None,
+            client_key: None,
+            request_id: None,
+            trace_id: None,
+            idempotency_key: None,
+            max_output_tokens: None,
+            stop_sequences: None,
+        };
+
+        let resp = chat.chat(req).await.expect("chat resp");
+        assert_eq!(resp.text, "pong");
+        assert_eq!(resp.provider, "openai");
+    }
 }

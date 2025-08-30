@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::config::{Config, Providers};
 use crate::error::CoreResult;
 use crate::provider::{Capability, ChatProvider, EmbedProvider, NullProvider, ProviderCaps};
+use crate::providers::openai::OpenAI;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -34,6 +35,19 @@ impl ProviderRegistry {
         embed.insert("null".into(), null.clone());
         caps.insert("null".into(), null.capabilities());
 
+        // --- OpenAI registration (enabled if OPENAI_API_KEY is present) ---
+        if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
+            let base = std::env::var("OPENAI_BASE").unwrap_or_else(|_| "https://api.openai.com".to_string());
+            let org = std::env::var("OPENAI_ORG").ok();
+
+            let http = crate::http_client::HttpClient::new_default()?;
+            let openai = Arc::new(OpenAI::new(http, api_key, base, org));
+
+            chat.insert("openai".to_string(), openai.clone());
+            embed.insert("openai".to_string(), openai.clone());
+            caps.insert("openai".to_string(), openai.capabilities());
+        }
+
         // Stubs for future wiring: once adapters exist, we'll construct them here and insert under their key names.
         // Validate presence of API keys if providers are configured, but return a clear not-implemented error for now.
         if has_any_provider(&cfg.providers) {
@@ -44,6 +58,29 @@ impl ProviderRegistry {
         }
 
         Ok(Self { chat, embed, caps })
+    }
+
+    /// Test-only helper to build a registry with a single OpenAI provider wired in.
+    /// This avoids touching environment variables in integration tests.
+    #[cfg(test)]
+    pub fn with_openai_for_tests(openai: Arc<OpenAI>) -> Self {
+        let mut chat: HashMap<String, Arc<dyn ChatProvider>> = HashMap::new();
+        let mut embed: HashMap<String, Arc<dyn EmbedProvider>> = HashMap::new();
+        let mut caps: HashMap<String, &'static [Capability]> = HashMap::new();
+
+        // Always include null for fallback behavior
+        let null = Arc::new(NullProvider);
+        chat.insert("null".into(), null.clone());
+        embed.insert("null".into(), null.clone());
+        caps.insert("null".into(), null.capabilities());
+
+        // Register the provided OpenAI instance for both chat and embed
+        chat.insert("openai".to_string(), openai.clone());
+        embed.insert("openai".to_string(), openai.clone());
+        const OAI_CAPS: &[Capability] = &[Capability::Chat, Capability::Embed];
+        caps.insert("openai".to_string(), OAI_CAPS);
+
+        Self { chat, embed, caps }
     }
 
     /// Get a chat provider by name (e.g., "openai", "anthropic", "null").
