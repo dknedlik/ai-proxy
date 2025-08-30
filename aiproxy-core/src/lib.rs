@@ -8,3 +8,4 @@ pub mod provider_factory;
 pub mod providers;
 pub mod router;
 pub mod stream;
+pub mod telemetry;
