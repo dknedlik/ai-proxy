@@ -9,6 +9,7 @@ use crate::model::{
     ChatMessage, ChatRequest, ChatResponse, EmbedRequest, EmbedResponse, StopReason,
 };
 use crate::provider::{Capability, ChatProvider, EmbedProvider, ProviderCaps};
+use crate::stream::{BoxStreamEv, StreamEvent};
 use secrecy::{ExposeSecret, SecretString};
 
 #[derive(Debug, Clone)]
@@ -85,6 +86,8 @@ struct OAChatReq<'a> {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +108,34 @@ struct OAChoice {
 struct OAUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+}
+
+// ---- Streaming wire structs (SSE "chunk" shape) ----
+// Temporary: unused until SSE transport is wired
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct OAChatStreamChunk {
+    id: Option<String>,
+    choices: Vec<OAStreamChoice>,
+}
+
+// Temporary: unused until SSE transport is wired
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct OAStreamChoice {
+    #[serde(default)]
+    delta: OAStreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+// Temporary: unused until SSE transport is wired
+#[allow(dead_code)]
+#[derive(Default, Deserialize)]
+struct OAStreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    // NOTE: extend here if/when we support tool calls, role changes, etc.
 }
 
 fn map_finish(s: Option<&str>) -> Option<StopReason> {
@@ -132,6 +163,7 @@ impl ChatProvider for OpenAI {
             top_p: req.top_p,
             max_tokens: req.max_output_tokens,
             stop: req.stop_sequences.clone(),
+            stream: None,
         };
         let ctx = RequestCtx {
             request_id: req.request_id.as_deref(),
@@ -197,6 +229,73 @@ impl ChatProvider for OpenAI {
             created_at_ms: Self::now_ms(),
             latency_ms,
         })
+    }
+
+    async fn chat_stream_events(&self, req: ChatRequest) -> CoreResult<BoxStreamEv> {
+        // Build payload with stream=true, initiate SSE
+        let payload = OAChatReq {
+            model: &req.model,
+            messages: &req.messages,
+            temperature: req.temperature,
+            top_p: req.top_p,
+            max_tokens: req.max_output_tokens,
+            stop: req.stop_sequences.clone(),
+            stream: Some(true),
+        };
+        let ctx = RequestCtx {
+            request_id: req.request_id.as_deref(),
+            turn_id: req.trace_id.as_deref(),
+            idempotency_key: req.idempotency_key.as_deref(),
+        };
+        let owned_headers = self.headers(&ctx);
+        let hdrs: Vec<(&str, &str)> = owned_headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let url = format!("{}/v1/chat/completions", self.base);
+
+        let mut sse = self.http.post_sse_lines(&url, &payload, &hdrs, &ctx).await?;
+
+        // Bridge SSE → StreamEvent via mpsc channel
+        use futures::channel::mpsc;
+        use futures_util::StreamExt;
+        let (tx, rx) = mpsc::unbounded::<StreamEvent>();
+
+        tokio::spawn(async move {
+            let mut sent_stop = false;
+            while let Some(line_res) = sse.next().await {
+                match line_res {
+                    Ok(line) => {
+                        let raw = line.line.trim();
+                        if raw == "data: [DONE]" { break; }
+                        if let Some(rest) = raw.strip_prefix("data:") {
+                            let json = rest.trim_start();
+                            if json.is_empty() { continue; }
+                            if let Ok(chunk) = serde_json::from_str::<OAChatStreamChunk>(json)
+                                && let Some(choice) = chunk.choices.first()
+                            {
+                                if let Some(ref txt) = choice.delta.content {
+                                    let _ = tx.unbounded_send(StreamEvent::DeltaText(txt.clone()));
+                                }
+                                if !sent_stop && choice.finish_reason.is_some() {
+                                    let _ = tx.unbounded_send(StreamEvent::Stop { reason: map_finish(choice.finish_reason.as_deref()) });
+                                    sent_stop = true;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.unbounded_send(StreamEvent::Error(e));
+                        return; // terminal
+                    }
+                }
+            }
+            if !sent_stop {
+                let _ = tx.unbounded_send(StreamEvent::Stop { reason: None });
+            }
+        });
+
+        Ok(Box::pin(rx))
     }
 }
 
@@ -282,7 +381,7 @@ impl EmbedProvider for OpenAI {
 
 impl ProviderCaps for OpenAI {
     fn capabilities(&self) -> &'static [Capability] {
-        &[Capability::Chat, Capability::Embed]
+        &[Capability::Chat, Capability::ChatStream, Capability::Embed]
     }
 }
 
@@ -729,5 +828,264 @@ mod tests {
         };
         let err = provider.chat(req).await.unwrap_err();
         assert!(matches!(err, AiProxyError::ProviderUnavailable { .. }));
+    }
+
+    #[tokio::test]
+    async fn chat_streaming_sse_happy_path() {
+        use std::sync::{Arc, Mutex};
+
+        let server = MockServer::start();
+        // Simulate an SSE body with two deltas, a stop, then [DONE]
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}] }\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}] }\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let _m = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse_body);
+        });
+
+        let provider = OpenAI::new_for_tests(&server.base_url());
+        let req = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![ChatMessage { role: Role::User, content: "Hi".into() }],
+            temperature: None,
+            top_p: None,
+            metadata: None,
+            client_key: None,
+            request_id: None,
+            trace_id: None,
+            idempotency_key: None,
+            max_output_tokens: None,
+            stop_sequences: None,
+        };
+
+        let deltas: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_stop: Arc<Mutex<Option<StopReason>>> = Arc::new(Mutex::new(None));
+
+        let d_clone = deltas.clone();
+        let s_clone = seen_stop.clone();
+        provider
+            .chat_streaming_sse(
+                req,
+                move |txt| {
+                    d_clone.lock().unwrap().push(txt.to_string());
+                },
+                move |reason| {
+                    *s_clone.lock().unwrap() = reason;
+                },
+            )
+            .await
+            .expect("stream ok");
+
+        let d = deltas.lock().unwrap().clone();
+        assert_eq!(d, vec!["Hel".to_string(), "lo".to_string()]);
+        let stop = *seen_stop.lock().unwrap();
+        assert_eq!(stop, Some(StopReason::Stop));
+    }
+
+    #[tokio::test]
+    async fn chat_streaming_sse_ignores_odd_lines_and_single_stop() {
+        use futures_util::stream;
+        use std::sync::{Arc, Mutex};
+
+        // Build a synthetic SSE line stream with blanks, comments, and proper data lines
+        let lines = vec![
+            Ok(crate::http_client::SseLine { line: "".into() }),
+            Ok(crate::http_client::SseLine { line: ":heartbeat".into() }),
+            Ok(crate::http_client::SseLine { line: "event: ping".into() }),
+            Ok(crate::http_client::SseLine { line: "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}".into() }),
+            Ok(crate::http_client::SseLine { line: "data:{\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}".into() }), // no space after colon
+            Ok(crate::http_client::SseLine { line: "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}".into() }),
+            Ok(crate::http_client::SseLine { line: "data: [DONE]".into() }),
+        ];
+        let sse = stream::iter(lines);
+
+        let deltas: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_stop: Arc<Mutex<Option<StopReason>>> = Arc::new(Mutex::new(None));
+
+        let d_clone = deltas.clone();
+        let s_clone = seen_stop.clone();
+
+        OpenAI::drive_openai_sse(
+            sse,
+            move |txt| d_clone.lock().unwrap().push(txt.to_string()),
+            move |reason| *s_clone.lock().unwrap() = reason,
+        )
+        .await
+        .expect("stream ok");
+
+        let d = deltas.lock().unwrap().clone();
+        assert_eq!(d, vec!["Hel".to_string(), "lo".to_string()]);
+        let stop = *seen_stop.lock().unwrap();
+        assert_eq!(stop, Some(StopReason::Stop));
+    }
+
+    #[tokio::test]
+    async fn chat_streaming_sse_no_explicit_stop_yields_none() {
+        use futures_util::stream;
+        use std::sync::{Arc, Mutex};
+
+        // Deltas followed by [DONE], no explicit finish_reason
+        let lines = vec![
+            Ok(crate::http_client::SseLine { line: "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}".into() }),
+            Ok(crate::http_client::SseLine { line: "data: [DONE]".into() }),
+        ];
+        let sse = stream::iter(lines);
+
+        let deltas: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_stop: Arc<Mutex<Option<StopReason>>> = Arc::new(Mutex::new(None));
+        let d_clone = deltas.clone();
+        let s_clone = seen_stop.clone();
+        OpenAI::drive_openai_sse(
+            sse,
+            move |txt| d_clone.lock().unwrap().push(txt.to_string()),
+            move |reason| *s_clone.lock().unwrap() = reason,
+        )
+        .await
+        .expect("stream ok");
+
+        let d = deltas.lock().unwrap().clone();
+        assert_eq!(d, vec!["Hi".to_string()]);
+        let stop = *seen_stop.lock().unwrap();
+        assert_eq!(stop, None);
+    }
+
+    #[tokio::test]
+    async fn chat_streaming_sse_multiple_finish_reasons_only_one_stop() {
+        use futures_util::stream;
+        use std::sync::{Arc, Mutex};
+
+        let lines = vec![
+            Ok(crate::http_client::SseLine { line: "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}".into() }),
+            Ok(crate::http_client::SseLine { line: "data: {\"choices\":[{\"finish_reason\":\"length\"}]}".into() }),
+            Ok(crate::http_client::SseLine { line: "data: [DONE]".into() }),
+        ];
+        let sse = stream::iter(lines);
+
+        let stop_calls: Arc<Mutex<Vec<Option<StopReason>>>> = Arc::new(Mutex::new(Vec::new()));
+        let s_clone = stop_calls.clone();
+        OpenAI::drive_openai_sse(sse, |_txt| {}, move |reason| s_clone.lock().unwrap().push(reason))
+            .await
+            .expect("stream ok");
+        let calls = stop_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], Some(StopReason::Stop));
+    }
+
+    #[tokio::test]
+    async fn chat_streaming_sse_stream_error_bubbles_and_no_stop() {
+        use futures_util::stream::{self, StreamExt};
+        use crate::error::AiProxyError;
+
+        // Build a stream that yields a line, then an error
+        let s1 = stream::iter(vec![Ok(crate::http_client::SseLine { line: "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}".into() })]);
+        let s2 = stream::iter(vec![Err(AiProxyError::ProviderUnavailable { provider: "http".into() })]);
+        let sse = s1.chain(s2);
+
+        let mut saw_stop = false;
+        let res = OpenAI::drive_openai_sse(
+            sse,
+            |_txt| {},
+            |_reason| { saw_stop = true; },
+        )
+        .await;
+
+        assert!(res.is_err());
+        assert!(!saw_stop, "on_stop should not be called on error path");
+    }
+}
+
+impl OpenAI {
+    /// Experimental: Streaming chat over SSE.
+    /// Calls `on_text_delta` for each content delta chunk and `on_stop` once when finish_reason arrives.
+    /// This is a thin wrapper intended to map OpenAI's SSE format into simple text deltas.
+    pub async fn chat_streaming_sse<F, G>(&self, req: ChatRequest, on_text_delta: F, on_stop: G) -> CoreResult<()>
+    where
+        F: FnMut(&str) + Send,
+        G: FnMut(Option<StopReason>) + Send,
+    {
+        // Build payload with stream=true
+        let payload = OAChatReq {
+            model: &req.model,
+            messages: &req.messages,
+            temperature: req.temperature,
+            top_p: req.top_p,
+            max_tokens: req.max_output_tokens,
+            stop: req.stop_sequences.clone(),
+            stream: Some(true),
+        };
+        let ctx = RequestCtx {
+            request_id: req.request_id.as_deref(),
+            turn_id: req.trace_id.as_deref(),
+            idempotency_key: req.idempotency_key.as_deref(),
+        };
+        let owned_headers = self.headers(&ctx);
+        let hdrs: Vec<(&str, &str)> = owned_headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let url = format!("{}/v1/chat/completions", self.base);
+        // Stream SSE lines and forward text deltas
+        let sse = self
+            .http
+            .post_sse_lines(&url, &payload, &hdrs, &ctx)
+            .await?;
+
+        Self::drive_openai_sse(sse, on_text_delta, on_stop).await
+    }
+
+    // Internal helper to drive an SSE line stream and invoke callbacks.
+    // Split out for easier unit testing without a real HTTP server.
+    pub(crate) async fn drive_openai_sse<St, F, G>(
+        mut sse: St,
+        mut on_text_delta: F,
+        mut on_stop: G,
+    ) -> CoreResult<()>
+    where
+        St: futures_util::stream::Stream<Item = CoreResult<crate::http_client::SseLine>> + Unpin,
+        F: FnMut(&str) + Send,
+        G: FnMut(Option<StopReason>) + Send,
+    {
+        use futures_util::StreamExt;
+
+        let mut sent_stop = false;
+        while let Some(line) = sse.next().await {
+            let line = line?;
+            let raw = line.line.trim();
+
+            // OpenAI terminator
+            if raw == "data: [DONE]" {
+                break;
+            }
+
+            // Accept both "data:..." and "data: ..." variants
+            if let Some(rest) = raw.strip_prefix("data:") {
+                let json = rest.trim_start();
+                if json.is_empty() { continue; }
+                if let Ok(chunk) = serde_json::from_str::<OAChatStreamChunk>(json)
+                    && let Some(choice) = chunk.choices.first()
+                {
+                    if let Some(ref txt) = choice.delta.content {
+                        on_text_delta(txt);
+                    }
+                    if !sent_stop && choice.finish_reason.is_some() {
+                        on_stop(map_finish(choice.finish_reason.as_deref()));
+                        sent_stop = true;
+                    }
+                }
+            }
+            // Ignore other SSE lines (e.g., comments/heartbeats)
+        }
+
+        if !sent_stop {
+            on_stop(None);
+        }
+        Ok(())
     }
 }

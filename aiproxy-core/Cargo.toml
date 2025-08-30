@@ -14,10 +14,12 @@ unicode-normalization = "0.1"
 async-trait = "0.1.89"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "test-util"] }
 regex = "1"
-reqwest = { version = "0.12", features = ["json", "gzip", "brotli", "deflate", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "gzip", "brotli", "deflate", "rustls-tls", "stream"] }
 http = "1"
 secrecy = "0.10.3"
 futures = "0.3.31"
+futures-util = "0.3.31"
+bytes = "1"
 
 [dev-dependencies]
 tempfile = "3"

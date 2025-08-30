@@ -53,3 +53,26 @@ Or, in case of an error:
 ## 5. Testing Notes
 
 Property-based and round-trip tests are used to verify that every stream emits **exactly one terminal event** at the end (`Stop`, `Final`, or `Error`). These tests ensure the contract is upheld, preventing ambiguous or incomplete stream lifecycles.
+
+## 6. Provider Usage (SSE)
+
+- OpenAI streaming helper: `providers/openai/mod.rs::OpenAI::chat_streaming_sse`.
+- Behavior: emits text deltas as they arrive and calls `on_stop` at most once when a finish reason is seen or when the stream ends without one.
+
+Quick example:
+
+```
+let provider = OpenAI::new_for_tests(&mock_url);
+let req = ChatRequest { /* model, messages, … */ .. };
+provider
+    .chat_streaming_sse(
+        req,
+        |delta| eprintln!("delta: {}", delta),
+        |stop| eprintln!("stop: {:?}", stop),
+    )
+    .await?;
+```
+
+Robustness:
+- Ignores blank lines, comments (e.g., lines starting with ':'), and non-`data:` SSE lines.
+- Accepts both `data: {...}` and `data:{...}` forms.

@@ -2,6 +2,7 @@ use async_trait::async_trait;
 
 use crate::error::CoreResult;
 use crate::model::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
+use crate::stream::{BoxStreamEv, StreamEvent};
 
 /// Capability marker for providers.
 /// Used to advertise what verbs a provider supports.
@@ -24,6 +25,14 @@ pub trait ChatProvider: Send + Sync + std::fmt::Debug {
         // default: call chat once and wrap it
         let single = self.chat(req).await?;
         Ok(vec![single])
+    }
+
+    /// Unified streaming API: returns a stream of `StreamEvent`s.
+    /// Default: produce a single `Final` event by calling `chat()` once.
+    async fn chat_stream_events(&self, req: ChatRequest) -> CoreResult<BoxStreamEv> {
+        let resp = self.chat(req).await?;
+        let s = futures::stream::iter(vec![StreamEvent::Final(resp)]);
+        Ok(Box::pin(s))
     }
 }
 
@@ -94,6 +103,7 @@ impl ProviderCaps for NullProvider {
 mod tests {
     use super::*;
     use crate::model::{ChatMessage, Role};
+    use futures_util::StreamExt;
 
     #[tokio::test]
     async fn null_provider_chat() {
@@ -132,5 +142,33 @@ mod tests {
         assert_eq!(resp.provider, "null");
         assert_eq!(resp.vectors.len(), 2);
         assert_eq!(resp.vectors[0].len(), 3);
+    }
+
+    #[tokio::test]
+    async fn default_stream_events_emits_final() {
+        let prov = NullProvider;
+        let req = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![ChatMessage { role: Role::User, content: "hi".into() }],
+            temperature: None,
+            top_p: None,
+            metadata: None,
+            client_key: None,
+            request_id: None,
+            trace_id: None,
+            idempotency_key: None,
+            max_output_tokens: None,
+            stop_sequences: None,
+        };
+        let stream = prov.chat_stream_events(req).await.expect("stream ok");
+        let evs: Vec<_> = stream.collect().await;
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            StreamEvent::Final(resp) => {
+                assert_eq!(resp.provider, "null");
+                assert_eq!(resp.text, "[null provider response]");
+            }
+            other => panic!("expected Final, got {other:?}"),
+        }
     }
 }
