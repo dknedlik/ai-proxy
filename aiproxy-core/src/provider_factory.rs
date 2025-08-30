@@ -37,7 +37,8 @@ impl ProviderRegistry {
 
         // --- OpenAI registration (enabled if OPENAI_API_KEY is present) ---
         if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
-            let base = std::env::var("OPENAI_BASE").unwrap_or_else(|_| "https://api.openai.com".to_string());
+            let base = std::env::var("OPENAI_BASE")
+                .unwrap_or_else(|_| "https://api.openai.com".to_string());
             let org = std::env::var("OPENAI_ORG").ok();
 
             let http = crate::http_client::HttpClient::new_default()?;

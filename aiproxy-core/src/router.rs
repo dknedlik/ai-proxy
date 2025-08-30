@@ -186,9 +186,9 @@ mod tests {
 
     #[tokio::test]
     async fn router_selects_openai_and_calls_chat() {
+        use crate::providers::openai::OpenAI;
         use httpmock::{Method::POST, MockServer};
         use serde_json::json;
-        use crate::providers::openai::OpenAI;
 
         // Mock OpenAI server
         let server = MockServer::start();
@@ -209,7 +209,12 @@ mod tests {
 
         // Build registry directly with a test OpenAI pointing to mock server
         let http = crate::http_client::HttpClient::new_default().expect("http");
-        let oi = std::sync::Arc::new(OpenAI::new(http, "test-key".into(), server.base_url(), None));
+        let oi = std::sync::Arc::new(OpenAI::new(
+            http,
+            "test-key".into(),
+            server.base_url(),
+            None,
+        ));
         let reg = ProviderRegistry::with_openai_for_tests(oi);
 
         let chat = router.select_chat(&reg, "gpt-4o").expect("chat provider");

@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use reqwest::{Client, StatusCode};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::error::{AiProxyError, CoreResult};
 
@@ -66,10 +66,18 @@ impl HttpClient {
                 .header("User-Agent", &self.user_agent);
 
             // custom headers
-            for (k, v) in headers { req = req.header(*k, *v); }
-            if let Some(rid) = ctx.request_id { req = req.header("X-Request-Id", rid); }
-            if let Some(tid) = ctx.turn_id { req = req.header("X-Turn-Id", tid); }
-            if let Some(ik) = ctx.idempotency_key { req = req.header("Idempotency-Key", ik); }
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            if let Some(rid) = ctx.request_id {
+                req = req.header("X-Request-Id", rid);
+            }
+            if let Some(tid) = ctx.turn_id {
+                req = req.header("X-Turn-Id", tid);
+            }
+            if let Some(ik) = ctx.idempotency_key {
+                req = req.header("Idempotency-Key", ik);
+            }
             req = req.header("X-Retry-Attempt", attempt.to_string());
 
             let resp = match req.send().await {
@@ -78,11 +86,15 @@ impl HttpClient {
                     // network error
                     if ctx.idempotency_key.is_some() && attempt < MAX_RETRIES {
                         let delay = backoff_ms(attempt);
-                        if delay > 0 { tokio::time::sleep(std::time::Duration::from_millis(delay)).await; }
+                        if delay > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        }
                         attempt += 1;
                         continue;
                     } else {
-                        return Err(AiProxyError::ProviderUnavailable { provider: "http".into() });
+                        return Err(AiProxyError::ProviderUnavailable {
+                            provider: "http".into(),
+                        });
                     }
                 }
             };
@@ -94,21 +106,31 @@ impl HttpClient {
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
                 let ra = parse_retry_after(&headers);
-                if ctx.idempotency_key.is_some() && attempt < MAX_RETRIES && is_retryable_status(status) {
+                if ctx.idempotency_key.is_some()
+                    && attempt < MAX_RETRIES
+                    && is_retryable_status(status)
+                {
                     // Honor Retry-After if present, otherwise backoff
-                    let delay_ms = ra.map(|s| s.saturating_mul(1000)).unwrap_or_else(|| backoff_ms(attempt));
-                    if delay_ms > 0 { tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await; }
+                    let delay_ms = ra
+                        .map(|s| s.saturating_mul(1000))
+                        .unwrap_or_else(|| backoff_ms(attempt));
+                    if delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
                     attempt += 1;
                     continue;
                 }
                 return Err(map_http_error("http", status, ra, &text));
             }
 
-            let parsed = resp.json::<R>().await.map_err(|e| AiProxyError::ProviderError {
-                provider: "http".into(),
-                code: status.as_u16().to_string(),
-                message: format!("json decode error: {e}"),
-            })?;
+            let parsed = resp
+                .json::<R>()
+                .await
+                .map_err(|e| AiProxyError::ProviderError {
+                    provider: "http".into(),
+                    code: status.as_u16().to_string(),
+                    message: format!("json decode error: {e}"),
+                })?;
             let latency = start.elapsed().as_millis() as u32;
             return Ok((parsed, provider_request_id, latency));
         }
@@ -124,10 +146,18 @@ impl HttpClient {
         let mut attempt = 0usize;
         loop {
             let mut req = self.inner.get(url).header("User-Agent", &self.user_agent);
-            for (k, v) in headers { req = req.header(*k, *v); }
-            if let Some(rid) = ctx.request_id { req = req.header("X-Request-Id", rid); }
-            if let Some(tid) = ctx.turn_id { req = req.header("X-Turn-Id", tid); }
-            if let Some(ik) = ctx.idempotency_key { req = req.header("Idempotency-Key", ik); }
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            if let Some(rid) = ctx.request_id {
+                req = req.header("X-Request-Id", rid);
+            }
+            if let Some(tid) = ctx.turn_id {
+                req = req.header("X-Turn-Id", tid);
+            }
+            if let Some(ik) = ctx.idempotency_key {
+                req = req.header("Idempotency-Key", ik);
+            }
             req = req.header("X-Retry-Attempt", attempt.to_string());
 
             let resp = match req.send().await {
@@ -135,11 +165,15 @@ impl HttpClient {
                 Err(_e) => {
                     if ctx.idempotency_key.is_some() && attempt < MAX_RETRIES {
                         let delay = backoff_ms(attempt);
-                        if delay > 0 { tokio::time::sleep(std::time::Duration::from_millis(delay)).await; }
+                        if delay > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        }
                         attempt += 1;
                         continue;
                     } else {
-                        return Err(AiProxyError::ProviderUnavailable { provider: "http".into() });
+                        return Err(AiProxyError::ProviderUnavailable {
+                            provider: "http".into(),
+                        });
                     }
                 }
             };
@@ -151,20 +185,30 @@ impl HttpClient {
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
                 let ra = parse_retry_after(&headers);
-                if ctx.idempotency_key.is_some() && attempt < MAX_RETRIES && is_retryable_status(status) {
-                    let delay_ms = ra.map(|s| s.saturating_mul(1000)).unwrap_or_else(|| backoff_ms(attempt));
-                    if delay_ms > 0 { tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await; }
+                if ctx.idempotency_key.is_some()
+                    && attempt < MAX_RETRIES
+                    && is_retryable_status(status)
+                {
+                    let delay_ms = ra
+                        .map(|s| s.saturating_mul(1000))
+                        .unwrap_or_else(|| backoff_ms(attempt));
+                    if delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
                     attempt += 1;
                     continue;
                 }
                 return Err(map_http_error("http", status, ra, &text));
             }
 
-            let parsed = resp.json::<R>().await.map_err(|e| AiProxyError::ProviderError {
-                provider: "http".into(),
-                code: status.as_u16().to_string(),
-                message: format!("json decode error: {e}"),
-            })?;
+            let parsed = resp
+                .json::<R>()
+                .await
+                .map_err(|e| AiProxyError::ProviderError {
+                    provider: "http".into(),
+                    code: status.as_u16().to_string(),
+                    message: format!("json decode error: {e}"),
+                })?;
             let latency = start.elapsed().as_millis() as u32;
             return Ok((parsed, provider_request_id, latency));
         }
@@ -181,7 +225,9 @@ fn extract_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
     ];
     for k in CANDIDATES {
         if let Some(v) = headers.get(k) {
-            if let Ok(s) = v.to_str() { return Some(s.to_string()); }
+            if let Ok(s) = v.to_str() {
+                return Some(s.to_string());
+            }
         }
     }
     None
@@ -200,7 +246,12 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     None
 }
 
-fn map_http_error(provider: &str, status: StatusCode, retry_after: Option<u64>, body: &str) -> AiProxyError {
+fn map_http_error(
+    provider: &str,
+    status: StatusCode,
+    retry_after: Option<u64>,
+    body: &str,
+) -> AiProxyError {
     match status {
         StatusCode::TOO_MANY_REQUESTS => AiProxyError::RateLimited {
             provider: provider.to_string(),
@@ -344,12 +395,15 @@ mod tests {
         });
         let client = HttpClient::new_default().expect("client");
         let ctx = RequestCtx::default();
-        let err = client.post_json::<_, serde_json::Value>(
-            &format!("{}/chat", server.base_url()),
-            &serde_json::json!({"msg":"hi"}),
-            &[],
-            &ctx,
-        ).await.unwrap_err();
+        let err = client
+            .post_json::<_, serde_json::Value>(
+                &format!("{}/chat", server.base_url()),
+                &serde_json::json!({"msg":"hi"}),
+                &[],
+                &ctx,
+            )
+            .await
+            .unwrap_err();
         match err {
             AiProxyError::ProviderError { code, .. } => assert_eq!(code, "200"),
             other => panic!("expected ProviderError, got: {:?}", other),
@@ -366,12 +420,15 @@ mod tests {
         });
         let client = HttpClient::new_default().expect("client");
         let ctx = RequestCtx::default();
-        let err = client.post_json::<_, serde_json::Value>(
-            &format!("{}/chat", server.base_url()),
-            &serde_json::json!({"msg":"hi"}),
-            &[],
-            &ctx,
-        ).await.unwrap_err();
+        let err = client
+            .post_json::<_, serde_json::Value>(
+                &format!("{}/chat", server.base_url()),
+                &serde_json::json!({"msg":"hi"}),
+                &[],
+                &ctx,
+            )
+            .await
+            .unwrap_err();
         match err {
             AiProxyError::ProviderError { message, .. } => assert!(message.ends_with("...")),
             other => panic!("expected ProviderError, got: {:?}", other),
@@ -384,12 +441,10 @@ mod tests {
         let client = HttpClient::new_default().expect("client");
         let ctx = RequestCtx::default();
         let url = "http://127.0.0.1:9/chat"; // port 9 (discard) is typically closed
-        let err = client.post_json::<_, serde_json::Value>(
-            url,
-            &serde_json::json!({"msg":"hi"}),
-            &[],
-            &ctx,
-        ).await.unwrap_err();
+        let err = client
+            .post_json::<_, serde_json::Value>(url, &serde_json::json!({"msg":"hi"}), &[], &ctx)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AiProxyError::ProviderUnavailable { .. }));
     }
 
@@ -397,25 +452,47 @@ mod tests {
     async fn post_json_retries_on_429_then_succeeds_with_idempotency() {
         let server = MockServer::start();
         let first = server.mock(|when, then| {
-            when.method(POST).path("/chat").header("X-Retry-Attempt", "0");
+            when.method(POST)
+                .path("/chat")
+                .header("X-Retry-Attempt", "0");
             then.status(429).header("Retry-After", "0").body("rate");
         });
         let second = server.mock(|when, then| {
-            when.method(POST).path("/chat").header("X-Retry-Attempt", "1");
+            when.method(POST)
+                .path("/chat")
+                .header("X-Retry-Attempt", "1");
             then.status(200).json_body(json!({"ok": true}));
         });
         let client = HttpClient::new_default().expect("client");
-        let ctx = RequestCtx { request_id: None, turn_id: None, idempotency_key: Some("ikey") };
-        #[derive(serde::Deserialize)] struct Resp { ok: bool }
-        let (resp, _, _) = client.post_json::<_, Resp>(
-            &format!("{}/chat", server.base_url()),
-            &json!({"msg":"hi"}),
-            &[],
-            &ctx,
-        ).await.expect("should retry then succeed");
+        let ctx = RequestCtx {
+            request_id: None,
+            turn_id: None,
+            idempotency_key: Some("ikey"),
+        };
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            ok: bool,
+        }
+        let (resp, _, _) = client
+            .post_json::<_, Resp>(
+                &format!("{}/chat", server.base_url()),
+                &json!({"msg":"hi"}),
+                &[],
+                &ctx,
+            )
+            .await
+            .expect("should retry then succeed");
         assert!(resp.ok);
-        assert_eq!(first.hits(), 1, "first mock (429) should be hit exactly once");
-        assert_eq!(second.hits(), 1, "second mock (200) should be hit exactly once");
+        assert_eq!(
+            first.hits(),
+            1,
+            "first mock (429) should be hit exactly once"
+        );
+        assert_eq!(
+            second.hits(),
+            1,
+            "second mock (200) should be hit exactly once"
+        );
         first.assert();
         second.assert();
     }
@@ -429,13 +506,19 @@ mod tests {
         });
         let client = HttpClient::new_default().expect("client");
         let ctx = RequestCtx::default();
-        let err = client.post_json::<_, serde_json::Value>(
-            &format!("{}/chat", server.base_url()),
-            &json!({"msg":"hi"}),
-            &[],
-            &ctx,
-        ).await.unwrap_err();
-        assert!(matches!(err, AiProxyError::ProviderUnavailable { .. } | AiProxyError::ProviderError { .. }));
+        let err = client
+            .post_json::<_, serde_json::Value>(
+                &format!("{}/chat", server.base_url()),
+                &json!({"msg":"hi"}),
+                &[],
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AiProxyError::ProviderUnavailable { .. } | AiProxyError::ProviderError { .. }
+        ));
         // Ensure we hit the first mock; second shouldn't be necessary for success
         first.assert();
     }

@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::CoreResult;
 use crate::http_client::{HttpClient, RequestCtx};
-use crate::model::{ChatMessage, ChatRequest, ChatResponse, EmbedRequest, EmbedResponse, StopReason};
+use crate::model::{
+    ChatMessage, ChatRequest, ChatResponse, EmbedRequest, EmbedResponse, StopReason,
+};
 use crate::provider::{Capability, ChatProvider, EmbedProvider, ProviderCaps};
 
 #[derive(Debug, Clone)]
@@ -19,17 +21,31 @@ pub struct OpenAI {
 
 impl OpenAI {
     pub fn new(http: HttpClient, api_key: String, base: String, org: Option<String>) -> Self {
-        Self { http, api_key, base, org, name: "openai".into() }
+        Self {
+            http,
+            api_key,
+            base,
+            org,
+            name: "openai".into(),
+        }
     }
 
     #[cfg(test)]
     pub fn new_for_tests(server_base: &str) -> Self {
-        OpenAI::new(HttpClient::new_default().unwrap(), "test-key".into(), server_base.to_string(), None)
+        OpenAI::new(
+            HttpClient::new_default().unwrap(),
+            "test-key".into(),
+            server_base.to_string(),
+            None,
+        )
     }
 
     fn headers(&self, _ctx: &RequestCtx<'_>) -> Vec<(String, String)> {
         let mut h = vec![
-            ("Authorization".to_string(), format!("Bearer {}", self.api_key)),
+            (
+                "Authorization".to_string(),
+                format!("Bearer {}", self.api_key),
+            ),
             ("Content-Type".to_string(), "application/json".to_string()),
         ];
         if let Some(org) = &self.org {
@@ -51,10 +67,14 @@ impl OpenAI {
 struct OAChatReq<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
-    #[serde(skip_serializing_if = "Option::is_none")] temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")] top_p: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")] max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")] stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -90,7 +110,9 @@ fn map_finish(s: Option<&str>) -> Option<StopReason> {
 
 #[async_trait]
 impl ChatProvider for OpenAI {
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
 
     async fn chat(&self, req: ChatRequest) -> CoreResult<ChatResponse> {
         let payload = OAChatReq {
@@ -107,7 +129,10 @@ impl ChatProvider for OpenAI {
             idempotency_key: req.idempotency_key.as_deref(),
         };
         let owned_headers = self.headers(&ctx);
-        let hdrs: Vec<(&str, &str)> = owned_headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let hdrs: Vec<(&str, &str)> = owned_headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         let url = format!("{}/v1/chat/completions", self.base);
         let (resp, provider_id, latency_ms) = self
             .http
@@ -163,13 +188,25 @@ struct OAVector {
 
 #[async_trait]
 impl EmbedProvider for OpenAI {
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
 
     async fn embed(&self, req: EmbedRequest) -> CoreResult<EmbedResponse> {
-        let payload = OAEmbedReq { model: &req.model, input: &req.inputs };
-        let ctx = RequestCtx { request_id: None, turn_id: None, idempotency_key: req.client_key.as_deref() };
+        let payload = OAEmbedReq {
+            model: &req.model,
+            input: &req.inputs,
+        };
+        let ctx = RequestCtx {
+            request_id: None,
+            turn_id: None,
+            idempotency_key: req.client_key.as_deref(),
+        };
         let owned_headers = self.headers(&ctx);
-        let hdrs: Vec<(&str, &str)> = owned_headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let hdrs: Vec<(&str, &str)> = owned_headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         let url = format!("{}/v1/embeddings", self.base);
         let (resp, _provider_id, _lat) = self
             .http
@@ -187,7 +224,9 @@ impl EmbedProvider for OpenAI {
 }
 
 impl ProviderCaps for OpenAI {
-    fn capabilities(&self) -> &'static [Capability] { &[Capability::Chat, Capability::Embed] }
+    fn capabilities(&self) -> &'static [Capability] {
+        &[Capability::Chat, Capability::Embed]
+    }
 }
 
 #[cfg(test)]
@@ -218,9 +257,10 @@ mod tests {
 
         let req = ChatRequest {
             model: "gpt-4o".into(),
-            messages: vec![
-                ChatMessage { role: Role::User, content: "Hi".into() }
-            ],
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "Hi".into(),
+            }],
             temperature: Some(1.0),
             top_p: Some(1.0),
             metadata: None,
@@ -279,7 +319,10 @@ mod tests {
 
         let req = ChatRequest {
             model: "gpt-4o".into(),
-            messages: vec![ChatMessage { role: Role::User, content: "Hi".into() }],
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "Hi".into(),
+            }],
             temperature: None,
             top_p: None,
             metadata: None,
@@ -313,7 +356,10 @@ mod tests {
             });
             let req = ChatRequest {
                 model: "gpt-4o".into(),
-                messages: vec![ChatMessage { role: Role::User, content: "Hi".into() }],
+                messages: vec![ChatMessage {
+                    role: Role::User,
+                    content: "Hi".into(),
+                }],
                 temperature: None,
                 top_p: None,
                 metadata: None,
@@ -352,7 +398,10 @@ mod tests {
 
         let req = ChatRequest {
             model: "gpt-4o".into(),
-            messages: vec![ChatMessage { role: Role::User, content: "Hi".into() }],
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "Hi".into(),
+            }],
             temperature: None,
             top_p: None,
             metadata: None,
@@ -387,7 +436,10 @@ mod tests {
 
         let req = ChatRequest {
             model: "gpt-4o".into(),
-            messages: vec![ChatMessage { role: Role::User, content: "Hi".into() }],
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "Hi".into(),
+            }],
             temperature: None,
             top_p: None,
             metadata: None,
@@ -402,5 +454,196 @@ mod tests {
         let resp = provider.chat(req).await.expect("chat ok");
         assert_eq!(resp.usage_prompt, 0);
         assert_eq!(resp.usage_completion, 0);
+    }
+
+    use crate::error::AiProxyError;
+
+    #[tokio::test]
+    async fn chat_429_maps_to_rate_limited_none() {
+        let server = MockServer::start();
+        let provider = OpenAI::new_for_tests(&server.base_url());
+        let _m = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(429).body("limit");
+        });
+        let req = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "Hi".into(),
+            }],
+            temperature: None,
+            top_p: None,
+            metadata: None,
+            client_key: None,
+            request_id: None,
+            trace_id: None,
+            idempotency_key: None,
+            max_output_tokens: None,
+            stop_sequences: None,
+        };
+        let err = provider.chat(req).await.unwrap_err();
+        match err {
+            AiProxyError::RateLimited {
+                provider,
+                retry_after,
+            } => {
+                assert_eq!(provider, "http");
+                assert_eq!(retry_after, None);
+            }
+            other => panic!("expected RateLimited, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_429_with_retry_after_maps_to_rate_limited_some() {
+        let server = MockServer::start();
+        let provider = OpenAI::new_for_tests(&server.base_url());
+        let _m = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(429).header("Retry-After", "2").body("limit");
+        });
+        let req = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "Hi".into(),
+            }],
+            temperature: None,
+            top_p: None,
+            metadata: None,
+            client_key: None,
+            request_id: None,
+            trace_id: None,
+            idempotency_key: None,
+            max_output_tokens: None,
+            stop_sequences: None,
+        };
+        let err = provider.chat(req).await.unwrap_err();
+        match err {
+            AiProxyError::RateLimited { retry_after, .. } => assert_eq!(retry_after, Some(2)),
+            other => panic!("expected RateLimited, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_503_maps_to_provider_unavailable() {
+        let server = MockServer::start();
+        let provider = OpenAI::new_for_tests(&server.base_url());
+        let _m = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(503).body("down");
+        });
+        let req = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "Hi".into(),
+            }],
+            temperature: None,
+            top_p: None,
+            metadata: None,
+            client_key: None,
+            request_id: None,
+            trace_id: None,
+            idempotency_key: None,
+            max_output_tokens: None,
+            stop_sequences: None,
+        };
+        let err = provider.chat(req).await.unwrap_err();
+        assert!(matches!(err, AiProxyError::ProviderUnavailable { .. }));
+    }
+
+    #[tokio::test]
+    async fn chat_400_maps_to_provider_error_truncated() {
+        let server = MockServer::start();
+        let provider = OpenAI::new_for_tests(&server.base_url());
+        let big = "x".repeat(1000);
+        let _m = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(400).body(big);
+        });
+        let req = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "Hi".into(),
+            }],
+            temperature: None,
+            top_p: None,
+            metadata: None,
+            client_key: None,
+            request_id: None,
+            trace_id: None,
+            idempotency_key: None,
+            max_output_tokens: None,
+            stop_sequences: None,
+        };
+        let err = provider.chat(req).await.unwrap_err();
+        match err {
+            AiProxyError::ProviderError { code, message, .. } => {
+                assert_eq!(code, "400");
+                assert!(message.ends_with("..."));
+                assert!(message.len() <= 303); // "..." after 300 chars
+            }
+            other => panic!("expected ProviderError, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_200_bad_json_maps_to_provider_error() {
+        let server = MockServer::start();
+        let provider = OpenAI::new_for_tests(&server.base_url());
+        let _m = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).body("not-json");
+        });
+        let req = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "Hi".into(),
+            }],
+            temperature: None,
+            top_p: None,
+            metadata: None,
+            client_key: None,
+            request_id: None,
+            trace_id: None,
+            idempotency_key: None,
+            max_output_tokens: None,
+            stop_sequences: None,
+        };
+        let err = provider.chat(req).await.unwrap_err();
+        match err {
+            AiProxyError::ProviderError { code, message, .. } => {
+                assert_eq!(code, "200");
+                assert!(message.starts_with("json decode error"));
+            }
+            other => panic!("expected ProviderError, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_network_error_maps_to_unavailable() {
+        let provider = OpenAI::new_for_tests("http://127.0.0.1:9");
+        let req = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "Hi".into(),
+            }],
+            temperature: None,
+            top_p: None,
+            metadata: None,
+            client_key: None,
+            request_id: None,
+            trace_id: None,
+            idempotency_key: None,
+            max_output_tokens: None,
+            stop_sequences: None,
+        };
+        let err = provider.chat(req).await.unwrap_err();
+        assert!(matches!(err, AiProxyError::ProviderUnavailable { .. }));
     }
 }
