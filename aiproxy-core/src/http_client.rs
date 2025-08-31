@@ -13,6 +13,8 @@ use std::time::Instant;
 use reqwest::{Client, StatusCode};
 use serde::{de::DeserializeOwned, Serialize};
 
+use tracing::Instrument;
+
 use crate::error::{AiProxyError, CoreResult};
 
 /// Request context carries tracing IDs and idempotency key.
@@ -61,72 +63,102 @@ impl HttpClient {
         headers: &[(&str, &str)],
         ctx: &RequestCtx<'_>,
     ) -> CoreResult<(R, Option<String>, u32)> {
-        let start = Instant::now();
-        let mut req = self
-            .inner
-            .post(url)
-            .json(body)
-            .header("User-Agent", &self.user_agent);
-        // custom headers
-        for (k, v) in headers {
-            req = req.header(*k, *v);
-        }
-        req = apply_ctx_headers(req, ctx);
+        // Tracing span for HTTP request lifecycle
+        let span = tracing::info_span!(
+            "http.request",
+            provider = "http",
+            method = "POST",
+            url = %url,
+            turn_id = %ctx.turn_id.unwrap_or_default(),
+            request_id = %ctx.request_id.unwrap_or_default(),
+            idempotency_key = %ctx.idempotency_key.unwrap_or_default(),
+            status = tracing::field::Empty,
+            provider_request_id = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            error_kind = tracing::field::Empty,
+            error_message = tracing::field::Empty,
+        );
+        async move {
+            let start = Instant::now();
+            let mut req = self
+                .inner
+                .post(url)
+                .json(body)
+                .header("User-Agent", &self.user_agent);
+            // custom headers
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            req = apply_ctx_headers(req, ctx);
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|_e| AiProxyError::ProviderUnavailable {
-                provider: "http".into(),
-            })?;
+            let resp = req
+                .send()
+                .await
+                .map_err(|_e| AiProxyError::ProviderUnavailable {
+                    provider: "http".into(),
+                })?;
 
-        let status = resp.status();
-        let headers = resp.headers().clone();
-        let provider_request_id = extract_request_id(&headers);
+            let status = resp.status();
+            tracing::Span::current().record("status", tracing::field::display(status.as_u16()));
+            let headers = resp.headers().clone();
+            let provider_request_id = extract_request_id(&headers);
+            if let Some(ref rid) = provider_request_id {
+                tracing::Span::current().record("provider_request_id", tracing::field::display(rid));
+            }
 
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            let ra = parse_retry_after(&headers);
-            let latency = start.elapsed().as_millis() as u32;
-            // Telemetry: HTTP error
-            {
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                let ra = parse_retry_after(&headers);
+                let latency = start.elapsed().as_millis() as u32;
+                // Telemetry: HTTP error
+                {
+                    let trace = crate::telemetry::ProviderTrace::new()
+                        .provider("http")
+                        .latency_ms(latency as u64)
+                        .provider_request_id_opt(provider_request_id.as_deref())
+                        .error_kind("http_error")
+                        .error_message(&truncate(&text, 200));
+                    crate::telemetry::emit(trace);
+                }
+                tracing::Span::current().record("error_kind", tracing::field::display("http_error"));
+                tracing::Span::current().record("error_message", tracing::field::display(truncate(&text, 200)));
+                tracing::Span::current().record("latency_ms", latency as u64);
+                return Err(map_http_error("http", status, ra, &text));
+            }
+
+            let parsed = resp.json::<R>().await.map_err(|e| {
+                let latency = start.elapsed().as_millis() as u32;
+                // Telemetry: decode error
                 let trace = crate::telemetry::ProviderTrace::new()
                     .provider("http")
                     .latency_ms(latency as u64)
                     .provider_request_id_opt(provider_request_id.as_deref())
-                    .error_kind("http_error")
-                    .error_message(&truncate(&text, 200));
+                    .error_kind("decode_error")
+                    .error_message(&format!("json decode error: {e}"));
+                crate::telemetry::emit(trace);
+                tracing::Span::current().record("error_kind", tracing::field::display("decode_error"));
+                tracing::Span::current().record("error_message", tracing::field::display(format!("json decode error: {e}")));
+                tracing::Span::current().record("latency_ms", latency as u64);
+                AiProxyError::ProviderError {
+                    provider: "http".into(),
+                    code: status.as_u16().to_string(),
+                    message: format!("json decode error: {e}"),
+                }
+            })?;
+            let latency = start.elapsed().as_millis() as u32;
+            // Telemetry: success
+            {
+                let trace = crate::telemetry::ProviderTrace::new()
+                    .provider("http")
+                    .latency_ms(latency as u64)
+                    .provider_request_id_opt(provider_request_id.as_deref());
                 crate::telemetry::emit(trace);
             }
-            return Err(map_http_error("http", status, ra, &text));
+            tracing::Span::current().record("latency_ms", latency as u64);
+            Ok((parsed, provider_request_id, latency))
         }
-
-        let parsed = resp.json::<R>().await.map_err(|e| {
-            let latency = start.elapsed().as_millis() as u32;
-            // Telemetry: decode error
-            let trace = crate::telemetry::ProviderTrace::new()
-                .provider("http")
-                .latency_ms(latency as u64)
-                .provider_request_id_opt(provider_request_id.as_deref())
-                .error_kind("decode_error")
-                .error_message(&format!("json decode error: {e}"));
-            crate::telemetry::emit(trace);
-            AiProxyError::ProviderError {
-                provider: "http".into(),
-                code: status.as_u16().to_string(),
-                message: format!("json decode error: {e}"),
-            }
-        })?;
-        let latency = start.elapsed().as_millis() as u32;
-        // Telemetry: success
-        {
-            let trace = crate::telemetry::ProviderTrace::new()
-                .provider("http")
-                .latency_ms(latency as u64)
-                .provider_request_id_opt(provider_request_id.as_deref());
-            crate::telemetry::emit(trace);
-        }
-        Ok((parsed, provider_request_id, latency))
+        .instrument(span)
+        .await
     }
 
     /// POST JSON and return an SSE (Server-Sent Events) line stream.
@@ -138,7 +170,6 @@ impl HttpClient {
         headers: &[(&str, &str)],
         ctx: &RequestCtx<'_>,
     ) -> CoreResult<SseStream> {
-
         // Build request
         let start = Instant::now();
         let mut req = self
@@ -152,38 +183,77 @@ impl HttpClient {
         }
         req = apply_ctx_headers(req, ctx);
 
-        let resp = req.send().await.map_err(|_| AiProxyError::ProviderUnavailable {
-            provider: "http".into(),
-        })?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let headers = resp.headers().clone();
-            let ra = parse_retry_after(&headers);
-            let body = resp.text().await.unwrap_or_default();
-            let latency = start.elapsed().as_millis() as u64;
-            // Telemetry: HTTP error
-            {
-                let trace = crate::telemetry::ProviderTrace::new()
-                    .provider("http")
-                    .latency_ms(latency)
-                    .provider_request_id_opt(extract_request_id(&headers).as_deref())
-                    .error_kind("http_error")
-                    .error_message(&truncate(&body, 200));
-                crate::telemetry::emit(trace);
+        // HTTP request span for header roundtrip
+        let span = tracing::info_span!(
+            "http.request",
+            provider = "http",
+            method = "POST",
+            url = %url,
+            turn_id = %ctx.turn_id.unwrap_or_default(),
+            request_id = %ctx.request_id.unwrap_or_default(),
+            idempotency_key = %ctx.idempotency_key.unwrap_or_default(),
+            status = tracing::field::Empty,
+            provider_request_id = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            error_kind = tracing::field::Empty,
+            error_message = tracing::field::Empty,
+        );
+        let resp = {
+            let req = req;
+            let start = start;
+            async move {
+                let resp = req.send().await.map_err(|_| AiProxyError::ProviderUnavailable {
+                    provider: "http".into(),
+                })?;
+                let status = resp.status();
+                tracing::Span::current().record("status", tracing::field::display(status.as_u16()));
+                let headers = resp.headers().clone();
+                let provider_request_id = extract_request_id(&headers);
+                if let Some(ref rid) = provider_request_id {
+                    tracing::Span::current().record("provider_request_id", tracing::field::display(rid));
+                }
+                if !status.is_success() {
+                    let ra = parse_retry_after(&headers);
+                    let body = resp.text().await.unwrap_or_default();
+                    let latency = start.elapsed().as_millis() as u64;
+                    // Telemetry: HTTP error
+                    {
+                        let trace = crate::telemetry::ProviderTrace::new()
+                            .provider("http")
+                            .latency_ms(latency)
+                            .provider_request_id_opt(provider_request_id.as_deref())
+                            .error_kind("http_error")
+                            .error_message(&truncate(&body, 200));
+                        crate::telemetry::emit(trace);
+                    }
+                    tracing::Span::current().record("error_kind", tracing::field::display("http_error"));
+                    tracing::Span::current().record("error_message", tracing::field::display(truncate(&body, 200)));
+                    tracing::Span::current().record("latency_ms", latency as u64);
+                    return Err(map_http_error("http", status, ra, &body));
+                }
+                let latency = start.elapsed().as_millis() as u64;
+                tracing::Span::current().record("latency_ms", latency);
+                Ok::<_, AiProxyError>(resp)
             }
-            return Err(map_http_error("http", status, ra, &body));
-        }
+            .instrument(span)
+            .await?
+        };
 
         // Stream body as bytes and split on '\n'
         let provider_request_id = extract_request_id(resp.headers());
         let byte_stream = resp.bytes_stream();
         let line_stream = LineStream::new(Box::pin(byte_stream));
+        let sse_span = tracing::info_span!(
+            "sse.stream",
+            provider = "http",
+            provider_request_id = %provider_request_id.as_deref().unwrap_or("")
+        );
         let wrapped = TelemetryOnDrop {
             inner: Box::pin(line_stream),
             start,
             provider_request_id,
             emitted: false,
+            span: sse_span,
         };
         Ok(Box::pin(wrapped))
     }
@@ -194,63 +264,93 @@ impl HttpClient {
         headers: &[(&str, &str)],
         ctx: &RequestCtx<'_>,
     ) -> CoreResult<(R, Option<String>, u32)> {
-        let start = Instant::now();
-        let mut req = self.inner.get(url).header("User-Agent", &self.user_agent);
-        for (k, v) in headers { req = req.header(*k, *v); }
-        req = apply_ctx_headers(req, ctx);
+        // Tracing span for HTTP request lifecycle (GET)
+        let span = tracing::info_span!(
+            "http.request",
+            provider = "http",
+            method = "GET",
+            url = %url,
+            turn_id = %ctx.turn_id.unwrap_or_default(),
+            request_id = %ctx.request_id.unwrap_or_default(),
+            idempotency_key = %ctx.idempotency_key.unwrap_or_default(),
+            status = tracing::field::Empty,
+            provider_request_id = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            error_kind = tracing::field::Empty,
+            error_message = tracing::field::Empty,
+        );
+        async move {
+            let start = Instant::now();
+            let mut req = self.inner.get(url).header("User-Agent", &self.user_agent);
+            for (k, v) in headers { req = req.header(*k, *v); }
+            req = apply_ctx_headers(req, ctx);
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|_e| AiProxyError::ProviderUnavailable { provider: "http".into() })?;
+            let resp = req
+                .send()
+                .await
+                .map_err(|_e| AiProxyError::ProviderUnavailable { provider: "http".into() })?;
 
-        let status = resp.status();
-        let headers = resp.headers().clone();
-        let provider_request_id = extract_request_id(&headers);
+            let status = resp.status();
+            tracing::Span::current().record("status", tracing::field::display(status.as_u16()));
+            let headers = resp.headers().clone();
+            let provider_request_id = extract_request_id(&headers);
+            if let Some(ref rid) = provider_request_id {
+                tracing::Span::current().record("provider_request_id", tracing::field::display(rid));
+            }
 
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            let ra = parse_retry_after(&headers);
-            let latency = start.elapsed().as_millis() as u32;
-            // Telemetry: HTTP error
-            {
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                let ra = parse_retry_after(&headers);
+                let latency = start.elapsed().as_millis() as u32;
+                // Telemetry: HTTP error
+                {
+                    let trace = crate::telemetry::ProviderTrace::new()
+                        .provider("http")
+                        .latency_ms(latency as u64)
+                        .provider_request_id_opt(provider_request_id.as_deref())
+                        .error_kind("http_error")
+                        .error_message(&truncate(&text, 200));
+                    crate::telemetry::emit(trace);
+                }
+                tracing::Span::current().record("error_kind", tracing::field::display("http_error"));
+                tracing::Span::current().record("error_message", tracing::field::display(truncate(&text, 200)));
+                tracing::Span::current().record("latency_ms", latency as u64);
+                return Err(map_http_error("http", status, ra, &text));
+            }
+
+            let parsed = resp.json::<R>().await.map_err(|e| {
+                let latency = start.elapsed().as_millis() as u32;
+                // Telemetry: decode error
                 let trace = crate::telemetry::ProviderTrace::new()
                     .provider("http")
                     .latency_ms(latency as u64)
                     .provider_request_id_opt(provider_request_id.as_deref())
-                    .error_kind("http_error")
-                    .error_message(&truncate(&text, 200));
+                    .error_kind("decode_error")
+                    .error_message(&format!("json decode error: {e}"));
+                crate::telemetry::emit(trace);
+                tracing::Span::current().record("error_kind", tracing::field::display("decode_error"));
+                tracing::Span::current().record("error_message", tracing::field::display(format!("json decode error: {e}")));
+                tracing::Span::current().record("latency_ms", latency as u64);
+                AiProxyError::ProviderError {
+                    provider: "http".into(),
+                    code: status.as_u16().to_string(),
+                    message: format!("json decode error: {e}"),
+                }
+            })?;
+            let latency = start.elapsed().as_millis() as u32;
+            // Telemetry: success
+            {
+                let trace = crate::telemetry::ProviderTrace::new()
+                    .provider("http")
+                    .latency_ms(latency as u64)
+                    .provider_request_id_opt(provider_request_id.as_deref());
                 crate::telemetry::emit(trace);
             }
-            return Err(map_http_error("http", status, ra, &text));
+            tracing::Span::current().record("latency_ms", latency as u64);
+            Ok((parsed, provider_request_id, latency))
         }
-
-        let parsed = resp.json::<R>().await.map_err(|e| {
-            let latency = start.elapsed().as_millis() as u32;
-            // Telemetry: decode error
-            let trace = crate::telemetry::ProviderTrace::new()
-                .provider("http")
-                .latency_ms(latency as u64)
-                .provider_request_id_opt(provider_request_id.as_deref())
-                .error_kind("decode_error")
-                .error_message(&format!("json decode error: {e}"));
-            crate::telemetry::emit(trace);
-            AiProxyError::ProviderError {
-                provider: "http".into(),
-                code: status.as_u16().to_string(),
-                message: format!("json decode error: {e}"),
-            }
-        })?;
-        let latency = start.elapsed().as_millis() as u32;
-        // Telemetry: success
-        {
-            let trace = crate::telemetry::ProviderTrace::new()
-                .provider("http")
-                .latency_ms(latency as u64)
-                .provider_request_id_opt(provider_request_id.as_deref());
-            crate::telemetry::emit(trace);
-        }
-        Ok((parsed, provider_request_id, latency))
+        .instrument(span)
+        .await
     }
 }
 
@@ -396,6 +496,7 @@ struct TelemetryOnDrop<S> {
     start: Instant,
     provider_request_id: Option<String>,
     emitted: bool,
+    span: tracing::Span,
 }
 
 impl<S> futures_util::stream::Stream for TelemetryOnDrop<S>
@@ -413,6 +514,8 @@ where
                 if !self.emitted {
                     self.emitted = true;
                     let latency = self.start.elapsed().as_millis() as u64;
+                    let _enter = self.span.enter();
+                    tracing::Span::current().record("latency_ms", latency);
                     let trace = crate::telemetry::ProviderTrace::new()
                         .provider("http")
                         .latency_ms(latency)

@@ -156,6 +156,20 @@ impl ChatProvider for OpenAI {
     }
 
     async fn chat(&self, req: ChatRequest) -> CoreResult<ChatResponse> {
+        use tracing::{field, info_span, Instrument};
+        let model_for_span = req.model.clone();
+        let turn_for_span = req.trace_id.clone().unwrap_or_default();
+        let reqid_for_span = req.request_id.clone().unwrap_or_default();
+        let span = info_span!(
+            "provider.call",
+            provider = "openai",
+            model = %model_for_span,
+            turn_id = %turn_for_span,
+            request_id = %reqid_for_span,
+            latency_ms = field::Empty,
+            finish_reason = field::Empty,
+        );
+        async move {
         let payload = OAChatReq {
             model: &req.model,
             messages: &req.messages,
@@ -165,6 +179,7 @@ impl ChatProvider for OpenAI {
             stop: req.stop_sequences.clone(),
             stream: None,
         };
+        let started = std::time::Instant::now();
         let ctx = RequestCtx {
             request_id: req.request_id.as_deref(),
             turn_id: req.trace_id.as_deref(), // we’ll thread a real turn_id at the HTTP layer later
@@ -215,7 +230,7 @@ impl ChatProvider for OpenAI {
             .map(|u| (u.prompt_tokens, u.completion_tokens))
             .unwrap_or((0, 0));
 
-        Ok(ChatResponse {
+        let resp = ChatResponse {
             model: req.model,
             text,
             usage_prompt: usage_p,
@@ -228,7 +243,16 @@ impl ChatProvider for OpenAI {
             provider_request_id: provider_id.or(Some(resp.id)),
             created_at_ms: Self::now_ms(),
             latency_ms,
-        })
+        };
+        if let Some(fr) = resp.stop_reason.as_ref() {
+            let s = stop_to_string(*fr);
+            tracing::Span::current().record("finish_reason", tracing::field::display(s));
+        }
+        tracing::Span::current().record("latency_ms", started.elapsed().as_millis() as u64);
+        Ok(resp)
+        }
+        .instrument(span)
+        .await
     }
 
     async fn chat_stream_events(&self, req: ChatRequest) -> CoreResult<BoxStreamEv> {
@@ -1013,7 +1037,22 @@ impl OpenAI {
         use std::time::Instant;
         use std::sync::{Arc, Mutex};
         let started = Instant::now();
-        // Build payload with stream=true
+        // Stream SSE lines and forward text deltas
+        use tracing::{field, info_span, Instrument};
+        let model_for_span = req.model.clone();
+        let turn_for_span = req.trace_id.clone().unwrap_or_default();
+        let reqid_for_span = req.request_id.clone().unwrap_or_default();
+        let outer = info_span!(
+            "provider.call",
+            provider = "openai",
+            model = %model_for_span,
+            turn_id = %turn_for_span,
+            request_id = %reqid_for_span,
+            latency_ms = field::Empty,
+            finish_reason = field::Empty,
+        );
+        async move {
+        // Build payload with stream=true (inside move so we can borrow req safely)
         let payload = OAChatReq {
             model: &req.model,
             messages: &req.messages,
@@ -1034,11 +1073,7 @@ impl OpenAI {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         let url = format!("{}/v1/chat/completions", self.base);
-        // Stream SSE lines and forward text deltas
-        let sse = self
-            .http
-            .post_sse_lines(&url, &payload, &hdrs, &ctx)
-            .await?;
+        let sse = self.http.post_sse_lines(&url, &payload, &hdrs, &ctx).await?;
 
         // Wrap stop callback to capture finish reason for telemetry
         let finish_shared: Arc<Mutex<Option<StopReason>>> = Arc::new(Mutex::new(None));
@@ -1061,8 +1096,12 @@ impl OpenAI {
             .finish_reason_opt(fr_str.as_deref())
             .latency_ms(started.elapsed().as_millis() as u64);
         crate::telemetry::emit(trace);
-
+        if let Some(ref s) = fr_str { tracing::Span::current().record("finish_reason", tracing::field::display(s)); }
+        tracing::Span::current().record("latency_ms", started.elapsed().as_millis() as u64);
         res
+        }
+        .instrument(outer)
+        .await
     }
 
     // Internal helper to drive an SSE line stream and invoke callbacks.
