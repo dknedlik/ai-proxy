@@ -3,6 +3,8 @@
 
 pub mod keys;
 pub mod types;
+#[cfg(test)]
+pub mod test_span;
 
 pub use keys::*;
 pub use types::*;

@@ -110,17 +110,12 @@ struct OAUsage {
     completion_tokens: u32,
 }
 
-// ---- Streaming wire structs (SSE "chunk" shape) ----
-// Temporary: unused until SSE transport is wired
-#[allow(dead_code)]
+// ---- Streaming wire structs (SSE "chunk" shape) — actively used by drive_openai_sse ----
 #[derive(Deserialize)]
 struct OAChatStreamChunk {
-    id: Option<String>,
     choices: Vec<OAStreamChoice>,
 }
 
-// Temporary: unused until SSE transport is wired
-#[allow(dead_code)]
 #[derive(Deserialize)]
 struct OAStreamChoice {
     #[serde(default)]
@@ -129,8 +124,6 @@ struct OAStreamChoice {
     finish_reason: Option<String>,
 }
 
-// Temporary: unused until SSE transport is wired
-#[allow(dead_code)]
 #[derive(Default, Deserialize)]
 struct OAStreamDelta {
     #[serde(default)]
@@ -238,7 +231,7 @@ impl ChatProvider for OpenAI {
             cached: false,
             provider: self.name.clone(),
             transcript_id: None,
-            turn_id: req.request_id.unwrap_or_else(|| "turn".into()),
+            turn_id: req.trace_id.unwrap_or_else(|| "turn".into()),
             stop_reason,
             provider_request_id: provider_id.or(Some(resp.id)),
             created_at_ms: Self::now_ms(),
@@ -911,6 +904,64 @@ mod tests {
         assert_eq!(d, vec!["Hel".to_string(), "lo".to_string()]);
         let stop = *seen_stop.lock().unwrap();
         assert_eq!(stop, Some(StopReason::Stop));
+    }
+
+    #[tokio::test]
+    async fn provider_call_span_records_finish_reason() {
+        let span_store = crate::telemetry::test_span::install_capture();
+        let server = httpmock::MockServer::start();
+        // Mock non-streaming JSON response with finish_reason
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "cmpl_test",
+                    "choices": [{
+                        "message": {"role":"assistant", "content":"ok"},
+                        "finish_reason": "stop"
+                    }]
+                }));
+        });
+
+        let provider = OpenAI::new_for_tests(&server.base_url());
+        let req = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![ChatMessage { role: Role::User, content: "Hi".into() }],
+            temperature: None,
+            top_p: None,
+            metadata: None,
+            client_key: None,
+            request_id: Some("rid-1".into()),
+            trace_id: Some("tid-1".into()),
+            idempotency_key: None,
+            max_output_tokens: None,
+            stop_sequences: None,
+        };
+
+        // Use non-streaming chat to ensure provider.call span is emitted
+        let _ = provider.chat(req).await.expect("chat ok");
+
+        // Inspect provider.call span fields
+        let spans = span_store.spans.lock().unwrap();
+        let mut found = false;
+        for (_id, data) in spans.iter() {
+            if data.name == "provider.call" {
+                let fields = data.fields.lock().unwrap();
+                let norm = |k: &str| fields.get(k).map(|s| s.trim_matches('"')).unwrap_or("");
+                assert_eq!(norm("provider"), "openai");
+                assert_eq!(norm("model"), "gpt-4o");
+                assert_eq!(norm("turn_id"), "tid-1");
+                assert_eq!(norm("request_id"), "rid-1");
+                let fr = fields.get("finish_reason").cloned().unwrap_or_default();
+                assert!(fr.contains("Stop"));
+                assert!(fields.get("latency_ms").is_some());
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "provider.call span not found; have: {spans:?}");
     }
 
     #[tokio::test]

@@ -122,7 +122,7 @@ impl HttpClient {
                 }
                 tracing::Span::current().record("error_kind", tracing::field::display("http_error"));
                 tracing::Span::current().record("error_message", tracing::field::display(truncate(&text, 200)));
-                tracing::Span::current().record("latency_ms", latency as u64);
+                tracing::Span::current().record("latency_ms", latency);
                 return Err(map_http_error("http", status, ra, &text));
             }
 
@@ -138,7 +138,7 @@ impl HttpClient {
                 crate::telemetry::emit(trace);
                 tracing::Span::current().record("error_kind", tracing::field::display("decode_error"));
                 tracing::Span::current().record("error_message", tracing::field::display(format!("json decode error: {e}")));
-                tracing::Span::current().record("latency_ms", latency as u64);
+                tracing::Span::current().record("latency_ms", latency);
                 AiProxyError::ProviderError {
                     provider: "http".into(),
                     code: status.as_u16().to_string(),
@@ -154,7 +154,7 @@ impl HttpClient {
                     .provider_request_id_opt(provider_request_id.as_deref());
                 crate::telemetry::emit(trace);
             }
-            tracing::Span::current().record("latency_ms", latency as u64);
+            tracing::Span::current().record("latency_ms", latency);
             Ok((parsed, provider_request_id, latency))
         }
         .instrument(span)
@@ -200,7 +200,6 @@ impl HttpClient {
         );
         let resp = {
             let req = req;
-            let start = start;
             async move {
                 let resp = req.send().await.map_err(|_| AiProxyError::ProviderUnavailable {
                     provider: "http".into(),
@@ -228,7 +227,7 @@ impl HttpClient {
                     }
                     tracing::Span::current().record("error_kind", tracing::field::display("http_error"));
                     tracing::Span::current().record("error_message", tracing::field::display(truncate(&body, 200)));
-                    tracing::Span::current().record("latency_ms", latency as u64);
+                    tracing::Span::current().record("latency_ms", latency);
                     return Err(map_http_error("http", status, ra, &body));
                 }
                 let latency = start.elapsed().as_millis() as u64;
@@ -246,7 +245,9 @@ impl HttpClient {
         let sse_span = tracing::info_span!(
             "sse.stream",
             provider = "http",
-            provider_request_id = %provider_request_id.as_deref().unwrap_or("")
+            provider_request_id = %provider_request_id.as_deref().unwrap_or(""),
+            latency_ms = tracing::field::Empty,
+            error_kind = tracing::field::Empty,
         );
         let wrapped = TelemetryOnDrop {
             inner: Box::pin(line_stream),
@@ -314,7 +315,7 @@ impl HttpClient {
                 }
                 tracing::Span::current().record("error_kind", tracing::field::display("http_error"));
                 tracing::Span::current().record("error_message", tracing::field::display(truncate(&text, 200)));
-                tracing::Span::current().record("latency_ms", latency as u64);
+                tracing::Span::current().record("latency_ms", latency);
                 return Err(map_http_error("http", status, ra, &text));
             }
 
@@ -330,7 +331,7 @@ impl HttpClient {
                 crate::telemetry::emit(trace);
                 tracing::Span::current().record("error_kind", tracing::field::display("decode_error"));
                 tracing::Span::current().record("error_message", tracing::field::display(format!("json decode error: {e}")));
-                tracing::Span::current().record("latency_ms", latency as u64);
+                tracing::Span::current().record("latency_ms", latency);
                 AiProxyError::ProviderError {
                     provider: "http".into(),
                     code: status.as_u16().to_string(),
@@ -346,7 +347,7 @@ impl HttpClient {
                     .provider_request_id_opt(provider_request_id.as_deref());
                 crate::telemetry::emit(trace);
             }
-            tracing::Span::current().record("latency_ms", latency as u64);
+            tracing::Span::current().record("latency_ms", latency);
             Ok((parsed, provider_request_id, latency))
         }
         .instrument(span)
@@ -513,7 +514,7 @@ where
             std::task::Poll::Ready(None) => {
                 if !self.emitted {
                     self.emitted = true;
-                    let latency = self.start.elapsed().as_millis() as u64;
+                    let latency = (self.start.elapsed().as_millis() as u64).max(1);
                     let _enter = self.span.enter();
                     tracing::Span::current().record("latency_ms", latency);
                     let trace = crate::telemetry::ProviderTrace::new()
@@ -524,7 +525,22 @@ where
                 }
                 std::task::Poll::Ready(None)
             }
-            std::task::Poll::Ready(Some(item)) => std::task::Poll::Ready(Some(item)),
+            std::task::Poll::Ready(Some(item)) => {
+                if let Err(ref e) = item {
+                    let kind = match e {
+                        AiProxyError::ProviderError { code, .. } => code.as_str(),
+                        AiProxyError::ProviderUnavailable { .. } => "provider_unavailable",
+                        AiProxyError::RateLimited { .. } => "rate_limited",
+                        AiProxyError::Validation(_) => "validation",
+                        AiProxyError::Io(_) => "io",
+                        AiProxyError::Other(_) => "other",
+                        AiProxyError::BudgetExceeded { .. } => "budget_exceeded",
+                    };
+                    let _enter = self.span.enter();
+                    tracing::Span::current().record("error_kind", tracing::field::display(kind));
+                }
+                std::task::Poll::Ready(Some(item))
+            }
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
@@ -534,7 +550,9 @@ impl<S> Drop for TelemetryOnDrop<S> {
     fn drop(&mut self) {
         if !self.emitted {
             self.emitted = true;
-            let latency = self.start.elapsed().as_millis() as u64;
+            let latency = (self.start.elapsed().as_millis() as u64).max(1);
+            let _enter = self.span.enter();
+            tracing::Span::current().record("latency_ms", latency);
             let trace = crate::telemetry::ProviderTrace::new()
                 .provider("http")
                 .latency_ms(latency)
@@ -559,6 +577,143 @@ mod tests {
             TRACES.lock().unwrap_or_else(|e| e.into_inner()).push(trace);
         }
     }
+
+    #[tokio::test]
+    async fn sse_early_drop_records_latency() {
+        ensure_sink_installed();
+        let span_store = crate::telemetry::test_span::install_capture();
+        let server = MockServer::start();
+        // Single delta, no [DONE]; client will drop early
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n";
+        let _m = server.mock(|when, then| {
+            when.method(POST).path("/sse-one");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .header("x-request-id", "sse-early")
+                .body(sse_body);
+        });
+        let client = HttpClient::new_default().expect("client");
+        let ctx = RequestCtx::default();
+        let mut stream = client.post_sse_lines(
+            &format!("{}/sse-one", server.base_url()),
+            &serde_json::json!({"stream": true}),
+            &[],
+            &ctx,
+        ).await.expect("sse ok");
+
+        use futures_util::StreamExt;
+        let _first = stream.next().await.expect("one item");
+        drop(stream); // early drop should emit latency via Drop impl
+
+        // Telemetry emitted
+        let traces = TRACES.lock().unwrap_or_else(|e| e.into_inner());
+        let hit = traces.iter().rev().find(|t| t.provider.as_deref() == Some("http") && t.provider_request_id.as_deref() == Some("sse-early"));
+        assert!(hit.is_some(), "telemetry record for sse-early not found; have: {:?}", *traces);
+        let hit = hit.unwrap();
+        assert!(hit.latency_ms.unwrap_or(0) > 0);
+
+        // sse.stream span recorded latency
+        let spans = span_store.spans.lock().unwrap();
+        let mut saw = false;
+        for (_id, data) in spans.iter() {
+            if data.name == "sse.stream" {
+                let fields = data.fields.lock().unwrap();
+                let prid = fields.get("provider_request_id").cloned().unwrap_or_default();
+                if prid.trim_matches('"') == "sse-early" {
+                    assert!(fields.get("latency_ms").is_some());
+                    saw = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw, "sse.stream span for sse-early not found; have: {spans:?}");
+    }
+
+    #[tokio::test]
+    async fn get_json_success_span_fields() {
+        ensure_sink_installed();
+        let span_store = crate::telemetry::test_span::install_capture();
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/info");
+            then.status(200)
+                .header("x-request-id", "get123")
+                .json_body(json!({"ok": true}));
+        });
+        #[derive(serde::Deserialize)]
+        struct Resp { ok: bool }
+        let client = HttpClient::new_default().unwrap();
+        let ctx = RequestCtx::default();
+        let (resp, provider_id, latency) = client
+            .get_json::<Resp>(&format!("{}/info", server.base_url()), &[], &ctx)
+            .await
+            .unwrap();
+        assert!(resp.ok);
+        assert_eq!(provider_id, Some("get123".into()));
+        assert!(latency > 0);
+        m.assert();
+
+        // Span assertion
+        let spans = span_store.spans.lock().unwrap();
+        let mut found = false;
+        for (_id, data) in spans.iter() {
+            if data.name == "http.request" {
+                let fields = data.fields.lock().unwrap();
+                let url = fields.get("url").cloned().unwrap_or_default();
+                if url.contains("/info") {
+                    assert_eq!(fields.get("provider").map(String::as_str).unwrap_or(""), "\"http\"");
+                    assert_eq!(fields.get("method").map(String::as_str).unwrap_or(""), "\"GET\"");
+                    assert_eq!(fields.get("status").map(String::as_str).unwrap_or(""), "200");
+                    let prid = fields.get("provider_request_id").cloned().unwrap_or_default();
+                    assert_eq!(prid.trim_matches('"'), "get123");
+                    assert!(fields.get("latency_ms").is_some());
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "http.request span for GET /info not found; have: {spans:?}");
+    }
+
+    #[tokio::test]
+    async fn get_json_404_span_fields() {
+        ensure_sink_installed();
+        let span_store = crate::telemetry::test_span::install_capture();
+        let server = MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/missing");
+            then.status(404).body("nope");
+        });
+        let client = HttpClient::new_default().unwrap();
+        let ctx = RequestCtx::default();
+        let err = client
+            .get_json::<serde_json::Value>(&format!("{}/missing", server.base_url()), &[], &ctx)
+            .await
+            .unwrap_err();
+        match err {
+            AiProxyError::ProviderError { code, .. } => assert_eq!(code, "404"),
+            other => panic!("expected ProviderError, got: {:?}", other),
+        }
+
+        // Span assertion: method/status/error_kind present
+        let spans = span_store.spans.lock().unwrap();
+        let mut found = false;
+        for (_id, data) in spans.iter() {
+            if data.name == "http.request" {
+                let fields = data.fields.lock().unwrap();
+                let url = fields.get("url").cloned().unwrap_or_default();
+                if url.contains("/missing") {
+                    assert_eq!(fields.get("method").map(String::as_str).unwrap_or(""), "\"GET\"");
+                    assert_eq!(fields.get("status").map(String::as_str).unwrap_or(""), "404");
+                    assert!(fields.get("error_kind").is_some());
+                    assert!(fields.get("latency_ms").is_some());
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "http.request span for GET /missing not found; have: {spans:?}");
+    }
     static TRACES: once_cell::sync::Lazy<Mutex<Vec<crate::telemetry::ProviderTrace>>> =
         once_cell::sync::Lazy::new(|| Mutex::new(Vec::new()));
 
@@ -572,6 +727,7 @@ mod tests {
     #[tokio::test]
     async fn post_json_success() {
         ensure_sink_installed();
+        let span_store = crate::telemetry::test_span::install_capture();
         let server = MockServer::start();
         let m = server.mock(|when, then| {
             when.method(POST).path("/chat");
@@ -613,6 +769,27 @@ mod tests {
         assert!(hit.is_some(), "telemetry record with provider_request_id=abc123 not found; have: {:?}", *traces);
         let hit = hit.unwrap();
         assert!(hit.latency_ms.unwrap_or(0) > 0);
+
+        // Span assertion: http.request
+        let spans = span_store.spans.lock().unwrap();
+        let mut found = false;
+        for (_id, data) in spans.iter() {
+            if data.name == "http.request" {
+                let fields = data.fields.lock().unwrap();
+                let url = fields.get("url").cloned().unwrap_or_default();
+                if url.contains("/chat") {
+                    assert_eq!(fields.get("provider").map(String::as_str).unwrap_or(""), "\"http\"");
+                    assert_eq!(fields.get("method").map(String::as_str).unwrap_or(""), "\"POST\"");
+                    assert_eq!(fields.get("status").map(String::as_str).unwrap_or(""), "200");
+                    let prid = fields.get("provider_request_id").cloned().unwrap_or_default();
+                    assert_eq!(prid.trim_matches('"'), "abc123");
+                    assert!(fields.get("latency_ms").is_some());
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "http.request span with /chat not found; have: {spans:?}");
     }
 
     #[tokio::test]
@@ -656,6 +833,7 @@ mod tests {
     #[tokio::test]
     async fn post_json_503_maps_to_unavailable() {
         ensure_sink_installed();
+        let span_store = crate::telemetry::test_span::install_capture();
         let server = MockServer::start();
         let _m = server.mock(|when, then| {
             when.method(POST).path("/chat");
@@ -686,10 +864,30 @@ mod tests {
         assert!(hit.is_some(), "telemetry record with http_error not found; have: {:?}", *traces);
         let hit = hit.unwrap();
         assert!(hit.latency_ms.unwrap_or(0) > 0);
+
+        // Span assertion: http.request 503
+        let spans = span_store.spans.lock().unwrap();
+        let mut found = false;
+        for (_id, data) in spans.iter() {
+            if data.name == "http.request" {
+                let fields = data.fields.lock().unwrap();
+                let url = fields.get("url").cloned().unwrap_or_default();
+                if url.contains("/chat") {
+                    assert_eq!(fields.get("status").map(String::as_str).unwrap_or(""), "503");
+                    let ek = fields.get("error_kind").cloned().unwrap_or_default();
+                    assert!(ek.contains("http_error"));
+                    assert!(fields.get("latency_ms").is_some());
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "http.request 503 span not found; have: {spans:?}");
     }
 
     #[tokio::test]
     async fn post_json_200_bad_json_maps_to_provider_error() {
+        let span_store = crate::telemetry::test_span::install_capture();
         let server = MockServer::start();
         let _m = server.mock(|when, then| {
             when.method(POST).path("/chat");
@@ -707,6 +905,25 @@ mod tests {
             AiProxyError::ProviderError { code, .. } => assert_eq!(code, "200"),
             other => panic!("expected ProviderError, got: {:?}", other),
         }
+
+        // Spans: http.request records decode error
+        let spans = span_store.spans.lock().unwrap();
+        let mut found = false;
+        for (_id, data) in spans.iter() {
+            if data.name == "http.request" {
+                let fields = data.fields.lock().unwrap();
+                let url = fields.get("url").cloned().unwrap_or_default();
+                if url.contains("/chat") {
+                    assert_eq!(fields.get("status").map(String::as_str).unwrap_or(""), "200");
+                    let ek = fields.get("error_kind").cloned().unwrap_or_default();
+                    assert!(ek.contains("decode_error"));
+                    assert!(fields.get("latency_ms").is_some());
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "http.request decode_error span not found; have: {spans:?}");
     }
 
     #[tokio::test]
@@ -749,6 +966,7 @@ mod tests {
     #[tokio::test]
     async fn post_sse_lines_emits_telemetry_on_completion() {
         ensure_sink_installed();
+        let span_store = crate::telemetry::test_span::install_capture();
         let server = MockServer::start();
         // Simulate SSE with two chunks then DONE
         let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n\
@@ -779,5 +997,209 @@ data: [DONE]\n\n";
         assert!(last.latency_ms.unwrap_or(0) > 0);
         // provider_request_id should be captured
         assert_eq!(last.provider_request_id.as_deref(), Some("sse123"));
+
+        // Spans: http.request and sse.stream
+        let spans = span_store.spans.lock().unwrap();
+        let mut saw_http = false;
+        let mut saw_sse = false;
+        for (_id, data) in spans.iter() {
+            let fields = data.fields.lock().unwrap();
+            match data.name.as_str() {
+                "http.request" => {
+                    let url = fields.get("url").cloned().unwrap_or_default();
+                    if url.contains("/sse") {
+                        assert_eq!(fields.get("status").map(String::as_str).unwrap_or(""), "200");
+                        let prid = fields.get("provider_request_id").cloned().unwrap_or_default();
+                        assert_eq!(prid.trim_matches('"'), "sse123");
+                        saw_http = true;
+                    }
+                }
+                "sse.stream" => {
+                    let prid = fields.get("provider_request_id").cloned().unwrap_or_default();
+                    assert_eq!(prid.trim_matches('"'), "sse123");
+                    assert!(fields.get("latency_ms").is_some());
+                    saw_sse = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_http, "http.request span for /sse not found");
+        assert!(saw_sse, "sse.stream span not found");
+    }
+
+    #[tokio::test]
+    async fn post_sse_lines_buffer_overflow_sets_error_kind() {
+        ensure_sink_installed();
+        let span_store = crate::telemetry::test_span::install_capture();
+        let server = MockServer::start();
+        // Construct a large chunk > MAX_SSE_BUFFER with no newline
+        let big = "x".repeat(super::MAX_SSE_BUFFER + 1024);
+        let _m = server.mock(|when, then| {
+            when.method(POST).path("/sse-big");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .header("x-request-id", "big-1")
+                .body(big.clone());
+        });
+        let client = HttpClient::new_default().expect("client");
+        let ctx = RequestCtx::default();
+        let mut stream = client.post_sse_lines(
+            &format!("{}/sse-big", server.base_url()),
+            &serde_json::json!({"stream": true}),
+            &[],
+            &ctx,
+        ).await.expect("sse ok");
+
+        use futures_util::StreamExt;
+        let first = stream.next().await.expect("one item");
+        assert!(matches!(first, Err(AiProxyError::ProviderError { code, .. }) if code == "sse_buffer_overflow"));
+        drop(stream); // trigger Drop and span close
+
+        let spans = span_store.spans.lock().unwrap();
+        let mut saw_err = false;
+        for (_id, data) in spans.iter() {
+            if data.name == "sse.stream" {
+                let fields = data.fields.lock().unwrap();
+                if let Some(kind) = fields.get("error_kind") {
+                    assert!(kind.contains("sse_buffer_overflow"));
+                    saw_err = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_err, "sse.stream error_kind not recorded; have: {spans:?}");
+    }
+
+    #[tokio::test]
+    async fn sse_server_closes_without_done_records_latency_once() {
+        ensure_sink_installed();
+        let span_store = crate::telemetry::test_span::install_capture();
+        let server = MockServer::start();
+        // Two deltas, then connection closes without [DONE]
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}\n\n\
+                        data: {\"choices\":[{\"delta\":{\"content\":\"B\"}}]}\n\n";
+        let _m = server.mock(|when, then| {
+            when.method(POST).path("/sse-close");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .header("x-request-id", "sse-close-1")
+                .body(sse_body);
+        });
+        let client = HttpClient::new_default().expect("client");
+        let ctx = RequestCtx::default();
+        let mut stream = client.post_sse_lines(
+            &format!("{}/sse-close", server.base_url()),
+            &serde_json::json!({"stream": true}),
+            &[],
+            &ctx,
+        ).await.expect("sse ok");
+
+        use futures_util::StreamExt;
+        let mut count = 0usize;
+        while let Some(_line) = stream.next().await { count += 1; }
+        assert!(count >= 2);
+
+        // Telemetry emitted once with latency
+        let traces = TRACES.lock().unwrap_or_else(|e| e.into_inner());
+        let hits: Vec<_> = traces.iter().filter(|t| t.provider_request_id.as_deref() == Some("sse-close-1")).collect();
+        assert_eq!(hits.len(), 1, "expected exactly one telemetry emit, got {}: {:?}", hits.len(), *traces);
+        assert!(hits[0].latency_ms.unwrap_or(0) > 0);
+
+        // sse.stream span latency present
+        let spans = span_store.spans.lock().unwrap();
+        let mut saw = false;
+        for (_id, data) in spans.iter() {
+            if data.name == "sse.stream" {
+                let fields = data.fields.lock().unwrap();
+                let prid = fields.get("provider_request_id").cloned().unwrap_or_default();
+                if prid.trim_matches('"') == "sse-close-1" {
+                    assert!(fields.get("latency_ms").is_some());
+                    saw = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw, "sse.stream span for sse-close-1 not found; have: {spans:?}");
+    }
+
+    #[tokio::test]
+    async fn post_json_429_parses_retry_after_numeric() {
+        let server = MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(POST).path("/limit");
+            then.status(429)
+                .header("Retry-After", "3")
+                .body("slow down");
+        });
+        let client = HttpClient::new_default().expect("client");
+        let ctx = RequestCtx::default();
+        let err = client
+            .post_json::<_, serde_json::Value>(
+                &format!("{}/limit", server.base_url()),
+                &serde_json::json!({"msg":"hi"}),
+                &[],
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        match err {
+            AiProxyError::RateLimited { retry_after, .. } => assert_eq!(retry_after, Some(3)),
+            other => panic!("expected RateLimited with retry_after, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_headers_include_accept_and_ctx_ids() {
+        let server = MockServer::start();
+        // We will assert on headers by capturing the request in httpmock
+        let _m = server.mock(|when, then| {
+            when.method(POST)
+                .path("/sse-headers")
+                .header("Accept", "text/event-stream")
+                .header("X-Request-Id", "rid-1")
+                .header("X-Turn-Id", "tid-1");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .header("x-request-id", "hdr-123")
+                .body("data: {\"ok\":true}\n\n");
+        });
+        let client = HttpClient::new_default().expect("client");
+        let ctx = RequestCtx { request_id: Some("rid-1"), turn_id: Some("tid-1"), idempotency_key: None };
+        let mut stream = client.post_sse_lines(
+            &format!("{}/sse-headers", server.base_url()),
+            &serde_json::json!({"stream": true}),
+            &[],
+            &ctx,
+        ).await.expect("sse ok");
+        use futures_util::StreamExt; let _ = stream.next().await; // poke once
+    }
+
+    #[tokio::test]
+    async fn request_id_candidates_are_extracted() {
+        let ids = [
+            ("x-request-id", "rid-A"),
+            ("request-id", "rid-B"),
+            ("x-amzn-requestid", "rid-C"),
+            ("x-amz-request-id", "rid-D"),
+            ("x-cdn-request-id", "rid-E"),
+        ];
+        for (hdr, val) in ids.iter() {
+            let server = MockServer::start();
+            let _m = server.mock(|when, then| {
+                when.method(POST).path("/rid");
+                then.status(200)
+                    .header(*hdr, *val)
+                    .json_body(json!({"ok": true}));
+            });
+            #[derive(serde::Deserialize)] struct Resp { ok: bool }
+            let client = HttpClient::new_default().unwrap();
+            let ctx = RequestCtx::default();
+            let (resp, provider_id, _latency) = client
+                .post_json::<_, Resp>(&format!("{}/rid", server.base_url()), &json!({}), &[], &ctx)
+                .await
+                .unwrap();
+            assert!(resp.ok);
+            assert_eq!(provider_id.as_deref(), Some(*val));
+        }
     }
 }
