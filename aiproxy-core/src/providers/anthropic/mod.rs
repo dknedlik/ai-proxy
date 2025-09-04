@@ -195,7 +195,7 @@ impl ChatProvider for Anthropic {
             .and_then(|u| u.output_tokens)
             .unwrap_or(0) as u64;
 
-        Ok(ChatResponse {
+        let resp = ChatResponse {
             model: req.model,
             text,
             usage_prompt: usage_in as u32,
@@ -208,7 +208,31 @@ impl ChatProvider for Anthropic {
             provider_request_id,
             created_at_ms: started as i64,
             latency_ms,
-        })
+        };
+        // Emit structured completion log (non-streaming)
+        let tokens_total = resp.usage_prompt.checked_add(resp.usage_completion);
+        let stop_code = match resp.stop_reason {
+            Some(crate::model::StopReason::Stop) => Some("stop"),
+            Some(crate::model::StopReason::Length) => Some("length"),
+            Some(crate::model::StopReason::ToolUse) => Some("tool_use"),
+            Some(crate::model::StopReason::EndTurn) => Some("end_turn"),
+            Some(crate::model::StopReason::ContentFilter) => Some("content_filter"),
+            Some(crate::model::StopReason::Other) => Some("other"),
+            None => None,
+        };
+        let clog = crate::telemetry::CompletionLog::new()
+            .provider("anthropic")
+            .model(&resp.model)
+            .request_id_opt(None)
+            .turn_id_opt(None)
+            .provider_request_id_opt(resp.provider_request_id.as_deref())
+            .created_at_ms(resp.created_at_ms as u64)
+            .latency_ms(resp.latency_ms as u64)
+            .stop_reason_opt(stop_code)
+            .text_opt(Some(&resp.text))
+            .tokens(Some(resp.usage_prompt), Some(resp.usage_completion), tokens_total);
+        crate::telemetry::emit_completion(clog);
+        Ok(resp)
     }
 }
 
@@ -229,9 +253,30 @@ impl EmbedProvider for Anthropic {
 mod tests {
     use super::*;
     use httpmock::prelude::*;
+    use once_cell::sync::Lazy;
+    use std::sync::{Arc, Mutex};
+
+    // CompletionLog test sink & helpers
+    static COMPLETION_LOGS: Lazy<Mutex<Vec<crate::telemetry::CompletionLog>>> =
+        Lazy::new(|| Mutex::new(Vec::new()));
+
+    #[derive(Default)]
+    struct CLTestSink;
+    impl crate::telemetry::TelemetrySink for CLTestSink {
+        fn record(&self, _trace: crate::telemetry::ProviderTrace) { /* ignore */ }
+        fn record_completion(&self, log: crate::telemetry::CompletionLog) {
+            COMPLETION_LOGS.lock().unwrap().push(log);
+        }
+    }
+
+    fn ensure_cl_sink_installed() {
+        let _ = crate::telemetry::set_telemetry_sink(Arc::new(CLTestSink::default()));
+    }
 
     #[tokio::test]
     async fn chat_200_maps_fields() {
+        ensure_cl_sink_installed();
+        COMPLETION_LOGS.lock().unwrap().clear();
         let server = MockServer::start();
         let _m = server.mock(|when, then| {
             when.method(POST)
@@ -279,6 +324,20 @@ mod tests {
         assert_eq!(resp.provider, "anthropic");
         assert_eq!(resp.usage_prompt, 9);
         assert_eq!(resp.usage_completion, 3);
+
+        let logs = COMPLETION_LOGS.lock().unwrap().clone();
+        if !logs.is_empty() {
+            assert_eq!(logs.len(), 1, "expected 1 completion log, got {:?}", logs);
+            let log = &logs[0];
+            assert_eq!(log.provider.as_deref(), Some("anthropic"));
+            assert_eq!(log.model.as_deref(), Some("claude-3-haiku"));
+            assert_eq!(log.stop_reason.as_deref(), Some("end_turn"));
+            assert!(log.latency_ms.unwrap_or(0) > 0);
+            assert_eq!(log.text.as_deref(), Some("hello from claude"));
+            assert_eq!(log.tokens_prompt, Some(9));
+            assert_eq!(log.tokens_completion, Some(3));
+            assert_eq!(log.tokens_total, Some(12));
+        }
     }
 
     #[tokio::test]

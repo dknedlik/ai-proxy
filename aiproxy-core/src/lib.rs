@@ -9,3 +9,5 @@ pub mod providers;
 pub mod router;
 pub mod stream;
 pub mod telemetry;
+#[cfg(test)]
+pub mod test_util;

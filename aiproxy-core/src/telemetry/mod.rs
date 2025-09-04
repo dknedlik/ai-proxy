@@ -21,6 +21,9 @@ use once_cell::sync::OnceCell;
 /// - Keep overhead minimal; this may be on hot paths.
 pub trait TelemetrySink: Send + Sync + 'static {
     fn record(&self, trace: crate::telemetry::ProviderTrace);
+
+    // 1.15.5: optional completion event; default no-op to avoid breaking existing sinks
+    fn record_completion(&self, _log: crate::telemetry::CompletionLog) {}
 }
 
 static TELEMETRY_SINK: OnceCell<Arc<dyn TelemetrySink>> = OnceCell::new();
@@ -53,6 +56,20 @@ pub(crate) fn emit(trace: crate::telemetry::ProviderTrace) {
     }
     if let Some(sink) = TELEMETRY_SINK.get() {
         sink.record(trace);
+    }
+}
+
+/// Emit a structured completion event if a sink is installed. Crate-visible by design.
+#[inline]
+pub(crate) fn emit_completion(log: crate::telemetry::CompletionLog) {
+    #[cfg(test)]
+    {
+        if !TEST_CAPTURE.with(|c| c.get()) {
+            return;
+        }
+    }
+    if let Some(sink) = TELEMETRY_SINK.get() {
+        sink.record_completion(log);
     }
 }
 

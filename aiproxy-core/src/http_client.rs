@@ -169,7 +169,7 @@ impl HttpClient {
         body: &T,
         headers: &[(&str, &str)],
         ctx: &RequestCtx<'_>,
-    ) -> CoreResult<SseStream> {
+    ) -> CoreResult<(SseStream, Option<String>)> {
         // Build request
         let start = Instant::now();
         let mut req = self
@@ -252,11 +252,11 @@ impl HttpClient {
         let wrapped = TelemetryOnDrop {
             inner: Box::pin(line_stream),
             start,
-            provider_request_id,
+            provider_request_id: provider_request_id.clone(),
             emitted: false,
             span: sse_span,
         };
-        Ok(Box::pin(wrapped))
+        Ok((Box::pin(wrapped), provider_request_id))
     }
 
     pub async fn get_json<R: DeserializeOwned>(
@@ -568,19 +568,11 @@ mod tests {
     use httpmock::Method::POST;
     use httpmock::MockServer;
     use serde_json::json;
-    use std::sync::Mutex;
+    use crate::test_util::{install_trace_sink, TRACE_LOGS};
 
-    // ---- Test telemetry sink ----
-    struct TestSink;
-    impl crate::telemetry::TelemetrySink for TestSink {
-        fn record(&self, trace: crate::telemetry::ProviderTrace) {
-            TRACES.lock().unwrap_or_else(|e| e.into_inner()).push(trace);
-        }
-    }
-
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn sse_early_drop_records_latency() {
-        ensure_sink_installed();
+        install_trace_sink();
         let span_store = crate::telemetry::test_span::install_capture();
         let server = MockServer::start();
         // Single delta, no [DONE]; client will drop early
@@ -594,7 +586,7 @@ mod tests {
         });
         let client = HttpClient::new_default().expect("client");
         let ctx = RequestCtx::default();
-        let mut stream = client.post_sse_lines(
+        let (mut stream, _pid) = client.post_sse_lines(
             &format!("{}/sse-one", server.base_url()),
             &serde_json::json!({"stream": true}),
             &[],
@@ -606,7 +598,7 @@ mod tests {
         drop(stream); // early drop should emit latency via Drop impl
 
         // Telemetry emitted
-        let traces = TRACES.lock().unwrap_or_else(|e| e.into_inner());
+        let traces = TRACE_LOGS.lock().unwrap();
         let hit = traces.iter().rev().find(|t| t.provider.as_deref() == Some("http") && t.provider_request_id.as_deref() == Some("sse-early"));
         assert!(hit.is_some(), "telemetry record for sse-early not found; have: {:?}", *traces);
         let hit = hit.unwrap();
@@ -631,7 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_json_success_span_fields() {
-        ensure_sink_installed();
+        install_trace_sink();
         let span_store = crate::telemetry::test_span::install_capture();
         let server = MockServer::start();
         let m = server.mock(|when, then| {
@@ -677,7 +669,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_json_404_span_fields() {
-        ensure_sink_installed();
+        install_trace_sink();
         let span_store = crate::telemetry::test_span::install_capture();
         let server = MockServer::start();
         let _m = server.mock(|when, then| {
@@ -714,19 +706,11 @@ mod tests {
         }
         assert!(found, "http.request span for GET /missing not found; have: {spans:?}");
     }
-    static TRACES: once_cell::sync::Lazy<Mutex<Vec<crate::telemetry::ProviderTrace>>> =
-        once_cell::sync::Lazy::new(|| Mutex::new(Vec::new()));
+    
 
-    fn ensure_sink_installed() {
-        use std::sync::Arc;
-        let _ = crate::telemetry::set_telemetry_sink(Arc::new(TestSink));
-        crate::telemetry::test_set_capture_enabled(true);
-        TRACES.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    }
-
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn post_json_success() {
-        ensure_sink_installed();
+        install_trace_sink();
         let span_store = crate::telemetry::test_span::install_capture();
         let server = MockServer::start();
         let m = server.mock(|when, then| {
@@ -763,7 +747,7 @@ mod tests {
         m.assert();
 
         // Telemetry assertion
-        let traces = TRACES.lock().unwrap_or_else(|e| e.into_inner());
+        let traces = TRACE_LOGS.lock().unwrap();
         assert!(!traces.is_empty());
         let hit = traces.iter().rev().find(|t| t.provider.as_deref() == Some("http") && t.provider_request_id.as_deref() == Some("abc123"));
         assert!(hit.is_some(), "telemetry record with provider_request_id=abc123 not found; have: {:?}", *traces);
@@ -830,9 +814,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn post_json_503_maps_to_unavailable() {
-        ensure_sink_installed();
+        install_trace_sink();
         let span_store = crate::telemetry::test_span::install_capture();
         let server = MockServer::start();
         let _m = server.mock(|when, then| {
@@ -858,7 +842,7 @@ mod tests {
         matches!(err, AiProxyError::ProviderUnavailable { .. });
 
         // Telemetry assertion
-        let traces = TRACES.lock().unwrap_or_else(|e| e.into_inner());
+        let traces = TRACE_LOGS.lock().unwrap();
         assert!(!traces.is_empty());
         let hit = traces.iter().rev().find(|t| t.provider.as_deref() == Some("http") && t.error_kind.as_deref() == Some("http_error"));
         assert!(hit.is_some(), "telemetry record with http_error not found; have: {:?}", *traces);
@@ -950,22 +934,26 @@ mod tests {
 
     #[tokio::test]
     async fn network_error_maps_to_unavailable() {
-        // Attempt to connect to a likely-closed port to simulate network error quickly.
+        install_trace_sink();
+        // Use an unreachable loopback port to force a connect error deterministically
+        let url = "http://127.0.0.1:9/chat";
         let client = HttpClient::new_default().expect("client");
         let ctx = RequestCtx::default();
-        let url = "http://127.0.0.1:9/chat"; // port 9 (discard) is typically closed
         let err = client.post_json::<_, serde_json::Value>(
             url,
             &serde_json::json!({"msg":"hi"}),
             &[],
             &ctx,
         ).await.unwrap_err();
-        assert!(matches!(err, AiProxyError::ProviderUnavailable { .. }));
+        match err {
+            AiProxyError::ProviderUnavailable { .. } => {}
+            other => panic!("expected ProviderUnavailable, got: {:?}", other),
+        }
     }
 
     #[tokio::test]
     async fn post_sse_lines_emits_telemetry_on_completion() {
-        ensure_sink_installed();
+        install_trace_sink();
         let span_store = crate::telemetry::test_span::install_capture();
         let server = MockServer::start();
         // Simulate SSE with two chunks then DONE
@@ -980,7 +968,7 @@ data: [DONE]\n\n";
         });
         let client = HttpClient::new_default().expect("client");
         let ctx = RequestCtx::default();
-        let mut stream = client.post_sse_lines(
+        let (mut stream, _pid) = client.post_sse_lines(
             &format!("{}/sse", server.base_url()),
             &serde_json::json!({"stream": true}),
             &[],
@@ -990,13 +978,13 @@ data: [DONE]\n\n";
         use futures_util::StreamExt;
         while let Some(_line) = stream.next().await { /* drain */ }
 
-        let traces = TRACES.lock().unwrap_or_else(|e| e.into_inner());
+        let traces = TRACE_LOGS.lock().unwrap();
         assert!(!traces.is_empty());
-        let last = traces.last().unwrap();
-        assert_eq!(last.provider.as_deref(), Some("http"));
-        assert!(last.latency_ms.unwrap_or(0) > 0);
-        // provider_request_id should be captured
-        assert_eq!(last.provider_request_id.as_deref(), Some("sse123"));
+        let hit = traces.iter().rev().find(|t| t.provider.as_deref() == Some("http")
+            && t.provider_request_id.as_deref() == Some("sse123"));
+        assert!(hit.is_some(), "telemetry record with provider_request_id=sse123 not found; have: {:?}", *traces);
+        let hit = hit.unwrap();
+        assert!(hit.latency_ms.unwrap_or(0) > 0);
 
         // Spans: http.request and sse.stream
         let spans = span_store.spans.lock().unwrap();
@@ -1027,9 +1015,9 @@ data: [DONE]\n\n";
         assert!(saw_sse, "sse.stream span not found");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn post_sse_lines_buffer_overflow_sets_error_kind() {
-        ensure_sink_installed();
+        install_trace_sink();
         let span_store = crate::telemetry::test_span::install_capture();
         let server = MockServer::start();
         // Construct a large chunk > MAX_SSE_BUFFER with no newline
@@ -1043,7 +1031,7 @@ data: [DONE]\n\n";
         });
         let client = HttpClient::new_default().expect("client");
         let ctx = RequestCtx::default();
-        let mut stream = client.post_sse_lines(
+        let (mut stream, _pid) = client.post_sse_lines(
             &format!("{}/sse-big", server.base_url()),
             &serde_json::json!({"stream": true}),
             &[],
@@ -1070,9 +1058,9 @@ data: [DONE]\n\n";
         assert!(saw_err, "sse.stream error_kind not recorded; have: {spans:?}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn sse_server_closes_without_done_records_latency_once() {
-        ensure_sink_installed();
+        install_trace_sink();
         let span_store = crate::telemetry::test_span::install_capture();
         let server = MockServer::start();
         // Two deltas, then connection closes without [DONE]
@@ -1087,7 +1075,7 @@ data: [DONE]\n\n";
         });
         let client = HttpClient::new_default().expect("client");
         let ctx = RequestCtx::default();
-        let mut stream = client.post_sse_lines(
+        let (mut stream, _pid) = client.post_sse_lines(
             &format!("{}/sse-close", server.base_url()),
             &serde_json::json!({"stream": true}),
             &[],
@@ -1100,7 +1088,7 @@ data: [DONE]\n\n";
         assert!(count >= 2);
 
         // Telemetry emitted once with latency
-        let traces = TRACES.lock().unwrap_or_else(|e| e.into_inner());
+        let traces = TRACE_LOGS.lock().unwrap();
         let hits: Vec<_> = traces.iter().filter(|t| t.provider_request_id.as_deref() == Some("sse-close-1")).collect();
         assert_eq!(hits.len(), 1, "expected exactly one telemetry emit, got {}: {:?}", hits.len(), *traces);
         assert!(hits[0].latency_ms.unwrap_or(0) > 0);
@@ -1165,7 +1153,7 @@ data: [DONE]\n\n";
         });
         let client = HttpClient::new_default().expect("client");
         let ctx = RequestCtx { request_id: Some("rid-1"), turn_id: Some("tid-1"), idempotency_key: None };
-        let mut stream = client.post_sse_lines(
+        let (mut stream, _pid) = client.post_sse_lines(
             &format!("{}/sse-headers", server.base_url()),
             &serde_json::json!({"stream": true}),
             &[],

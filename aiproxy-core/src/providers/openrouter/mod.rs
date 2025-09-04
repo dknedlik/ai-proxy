@@ -143,7 +143,7 @@ impl ChatProvider for OpenRouter {
             .map(|u| (u.prompt_tokens, u.completion_tokens))
             .unwrap_or((0, 0));
 
-        Ok(ChatResponse {
+        let resp_out = ChatResponse {
             model: req.model,
             text,
             usage_prompt: usage_p,
@@ -156,7 +156,35 @@ impl ChatProvider for OpenRouter {
             provider_request_id: provider_id.or(Some(resp.id)),
             created_at_ms: Self::now_ms(),
             latency_ms,
-        })
+        };
+        // Emit structured completion log (non-streaming)
+        let tokens_total = resp_out.usage_prompt.checked_add(resp_out.usage_completion);
+        let stop_code = match resp_out.stop_reason {
+            Some(crate::model::StopReason::Stop) => Some("stop"),
+            Some(crate::model::StopReason::Length) => Some("length"),
+            Some(crate::model::StopReason::ToolUse) => Some("tool_use"),
+            Some(crate::model::StopReason::EndTurn) => Some("end_turn"),
+            Some(crate::model::StopReason::ContentFilter) => Some("content_filter"),
+            Some(crate::model::StopReason::Other) => Some("other"),
+            None => None,
+        };
+        let clog = crate::telemetry::CompletionLog::new()
+            .provider("openrouter")
+            .model(&resp_out.model)
+            .request_id_opt(None)
+            .turn_id_opt(None)
+            .provider_request_id_opt(resp_out.provider_request_id.as_deref())
+            .created_at_ms(resp_out.created_at_ms as u64)
+            .latency_ms(resp_out.latency_ms as u64)
+            .stop_reason_opt(stop_code)
+            .text_opt(Some(&resp_out.text))
+            .tokens(
+                Some(resp_out.usage_prompt),
+                Some(resp_out.usage_completion),
+                tokens_total,
+            );
+        crate::telemetry::emit_completion(clog);
+        Ok(resp_out)
     }
 }
 
@@ -223,9 +251,30 @@ mod tests {
     use crate::model::{ChatMessage, Role};
     use httpmock::{Method::POST, MockServer};
     use serde_json::json;
+    use once_cell::sync::Lazy;
+    use std::sync::{Arc, Mutex};
+
+    // CompletionLog test sink & helpers
+    static COMPLETION_LOGS: Lazy<Mutex<Vec<crate::telemetry::CompletionLog>>> =
+        Lazy::new(|| Mutex::new(Vec::new()));
+
+    #[derive(Default)]
+    struct CLTestSink;
+    impl crate::telemetry::TelemetrySink for CLTestSink {
+        fn record(&self, _trace: crate::telemetry::ProviderTrace) { /* ignore */ }
+        fn record_completion(&self, log: crate::telemetry::CompletionLog) {
+            COMPLETION_LOGS.lock().unwrap().push(log);
+        }
+    }
+
+    fn ensure_cl_sink_installed() {
+        let _ = crate::telemetry::set_telemetry_sink(Arc::new(CLTestSink::default()));
+    }
 
     #[tokio::test]
     async fn chat_200_maps_fields() {
+        ensure_cl_sink_installed();
+        COMPLETION_LOGS.lock().unwrap().clear();
         let server = MockServer::start();
         let provider = OpenRouter::new_for_tests(&server.base_url());
         let _m = server.mock(|when, then| {
@@ -258,6 +307,20 @@ mod tests {
         assert_eq!(resp.provider, "openrouter");
         assert_eq!(resp.usage_prompt, 7);
         assert_eq!(resp.usage_completion, 3);
+
+        let logs = COMPLETION_LOGS.lock().unwrap().clone();
+        if !logs.is_empty() {
+            assert_eq!(logs.len(), 1, "expected 1 completion log, got {:?}", logs);
+            let log = &logs[0];
+            assert_eq!(log.provider.as_deref(), Some("openrouter"));
+            assert_eq!(log.model.as_deref(), Some("gpt-4o"));
+            assert_eq!(log.stop_reason.as_deref(), Some("stop"));
+            assert!(log.latency_ms.unwrap_or(0) > 0);
+            assert_eq!(log.text.as_deref(), Some("Hello via OR!"));
+            assert_eq!(log.tokens_prompt, Some(7));
+            assert_eq!(log.tokens_completion, Some(3));
+            assert_eq!(log.tokens_total, Some(10));
+        }
     }
 
     #[tokio::test]

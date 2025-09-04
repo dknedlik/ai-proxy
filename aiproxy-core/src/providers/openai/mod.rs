@@ -175,7 +175,7 @@ impl ChatProvider for OpenAI {
         let started = std::time::Instant::now();
         let ctx = RequestCtx {
             request_id: req.request_id.as_deref(),
-            turn_id: req.trace_id.as_deref(), // we’ll thread a real turn_id at the HTTP layer later
+            turn_id: req.trace_id.as_deref(),
             idempotency_key: req.idempotency_key.as_deref(),
         };
         let owned_headers = self.headers(&ctx);
@@ -231,7 +231,7 @@ impl ChatProvider for OpenAI {
             cached: false,
             provider: self.name.clone(),
             transcript_id: None,
-            turn_id: req.trace_id.unwrap_or_else(|| "turn".into()),
+            turn_id: req.trace_id.clone().unwrap_or_else(|| "turn".into()),
             stop_reason,
             provider_request_id: provider_id.or(Some(resp.id)),
             created_at_ms: Self::now_ms(),
@@ -242,6 +242,21 @@ impl ChatProvider for OpenAI {
             tracing::Span::current().record("finish_reason", tracing::field::display(s));
         }
         tracing::Span::current().record("latency_ms", started.elapsed().as_millis() as u64);
+        // Emit structured completion log (non-streaming)
+        let tokens_total = resp.usage_prompt.checked_add(resp.usage_completion);
+        let stop_lc = resp.stop_reason.as_ref().map(|s| stop_to_code(*s));
+        let clog = crate::telemetry::CompletionLog::new()
+            .provider("openai")
+            .model(&resp.model)
+            .request_id_opt(req.request_id.as_deref())
+            .turn_id_opt(req.trace_id.as_deref())
+            .provider_request_id_opt(resp.provider_request_id.as_deref())
+            .created_at_ms(resp.created_at_ms as u64)
+            .latency_ms(resp.latency_ms as u64)
+            .stop_reason_opt(stop_lc)
+            .text_opt(Some(&resp.text))
+            .tokens(Some(resp.usage_prompt), Some(resp.usage_completion), tokens_total);
+        crate::telemetry::emit_completion(clog);
         Ok(resp)
         }
         .instrument(span)
@@ -271,13 +286,15 @@ impl ChatProvider for OpenAI {
             .collect();
         let url = format!("{}/v1/chat/completions", self.base);
 
-        let mut sse = self.http.post_sse_lines(&url, &payload, &hdrs, &ctx).await?;
+        let (mut sse, _provider_request_id) = self.http.post_sse_lines(&url, &payload, &hdrs, &ctx).await?;
 
-        // Bridge SSE → StreamEvent via mpsc channel
+        // Bridge SSE → StreamEvent via bounded mpsc channel
         use futures::channel::mpsc;
         use futures_util::StreamExt;
-        let (tx, rx) = mpsc::unbounded::<StreamEvent>();
+        use tracing::Instrument;
+        let (mut tx, rx) = mpsc::channel::<StreamEvent>(1024);
 
+        let bridge_span = tracing::info_span!("openai.sse.bridge");
         tokio::spawn(async move {
             let mut sent_stop = false;
             while let Some(line_res) = sse.next().await {
@@ -291,26 +308,30 @@ impl ChatProvider for OpenAI {
                             if let Ok(chunk) = serde_json::from_str::<OAChatStreamChunk>(json)
                                 && let Some(choice) = chunk.choices.first()
                             {
-                                if let Some(ref txt) = choice.delta.content {
-                                    let _ = tx.unbounded_send(StreamEvent::DeltaText(txt.clone()));
+                                if let Some(ref txt) = choice.delta.content
+                                    && tx.try_send(StreamEvent::DeltaText(txt.clone())).is_err()
+                                {
+                                    tracing::debug!("openai.sse.bridge: dropped delta due to backpressure");
                                 }
                                 if !sent_stop && choice.finish_reason.is_some() {
-                                    let _ = tx.unbounded_send(StreamEvent::Stop { reason: map_finish(choice.finish_reason.as_deref()) });
+                                    if tx.try_send(StreamEvent::Stop { reason: map_finish(choice.finish_reason.as_deref()) }).is_err() {
+                                        tracing::debug!("openai.sse.bridge: dropped stop due to backpressure");
+                                    }
                                     sent_stop = true;
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        let _ = tx.unbounded_send(StreamEvent::Error(e));
+                        let _ = tx.try_send(StreamEvent::Error(e));
                         return; // terminal
                     }
                 }
             }
             if !sent_stop {
-                let _ = tx.unbounded_send(StreamEvent::Stop { reason: None });
+                let _ = tx.try_send(StreamEvent::Stop { reason: None });
             }
-        });
+        }.instrument(bridge_span));
 
         Ok(Box::pin(rx))
     }
@@ -826,13 +847,11 @@ mod tests {
 
     #[tokio::test]
     async fn chat_network_error_maps_to_unavailable() {
-        let provider = OpenAI::new_for_tests("http://127.0.0.1:9");
+        // Use a guaranteed-invalid domain per RFC 2606
+        let provider = OpenAI::new_for_tests("http://nonexistent.invalid");
         let req = ChatRequest {
             model: "gpt-4o".into(),
-            messages: vec![ChatMessage {
-                role: Role::User,
-                content: "Hi".into(),
-            }],
+            messages: vec![ChatMessage { role: Role::User, content: "Hi".into() }],
             temperature: None,
             top_p: None,
             metadata: None,
@@ -844,7 +863,7 @@ mod tests {
             stop_sequences: None,
         };
         let err = provider.chat(req).await.unwrap_err();
-        assert!(matches!(err, AiProxyError::ProviderUnavailable { .. }));
+        assert!(matches!(err, crate::error::AiProxyError::ProviderUnavailable { .. }));
     }
 
     #[tokio::test]
@@ -1124,10 +1143,11 @@ impl OpenAI {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         let url = format!("{}/v1/chat/completions", self.base);
-        let sse = self.http.post_sse_lines(&url, &payload, &hdrs, &ctx).await?;
+        let (sse, provider_request_id) = self.http.post_sse_lines(&url, &payload, &hdrs, &ctx).await?;
 
-        // Wrap stop callback to capture finish reason for telemetry
+        // Wrap stop callback to capture finish reason for telemetry and accumulate text
         let finish_shared: Arc<Mutex<Option<StopReason>>> = Arc::new(Mutex::new(None));
+        let text_shared: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let mut user_on_stop = on_stop;
         let finish_clone = finish_shared.clone();
         let wrapped_stop = move |reason: Option<StopReason>| {
@@ -1135,7 +1155,17 @@ impl OpenAI {
             user_on_stop(reason);
         };
 
-        let res = Self::drive_openai_sse(sse, on_text_delta, wrapped_stop).await;
+        let mut on_text_delta_user = on_text_delta;
+        let text_for_cb = text_shared.clone();
+        let res = Self::drive_openai_sse(
+            sse,
+            move |delta| {
+                text_for_cb.lock().unwrap().push_str(delta);
+                on_text_delta_user(delta);
+            },
+            wrapped_stop,
+        )
+        .await;
 
         // Emit provider-level telemetry
         let fr_str = finish_shared.lock().unwrap().map(stop_to_string);
@@ -1149,6 +1179,20 @@ impl OpenAI {
         crate::telemetry::emit(trace);
         if let Some(ref s) = fr_str { tracing::Span::current().record("finish_reason", tracing::field::display(s)); }
         tracing::Span::current().record("latency_ms", started.elapsed().as_millis() as u64);
+        // Emit structured completion log (streaming)
+        let text_final = text_shared.lock().unwrap().clone();
+        let stop_lc = fr_str.as_deref();
+        let clog = crate::telemetry::CompletionLog::new()
+            .provider("openai")
+            .model(&req.model)
+            .request_id_opt(req.request_id.as_deref())
+            .turn_id_opt(req.trace_id.as_deref())
+            .provider_request_id_opt(provider_request_id.as_deref())
+            .created_at_ms(Self::now_ms() as u64)
+            .latency_ms(started.elapsed().as_millis() as u64)
+            .stop_reason_opt(stop_lc)
+            .text_opt(Some(&text_final));
+        crate::telemetry::emit_completion(clog);
         res
         }
         .instrument(outer)
@@ -1213,5 +1257,152 @@ fn stop_to_string(s: StopReason) -> String {
         StopReason::EndTurn => "EndTurn".into(),
         StopReason::ContentFilter => "ContentFilter".into(),
         StopReason::Other => "Other".into(),
+    }
+}
+
+fn stop_to_code(s: StopReason) -> &'static str {
+    match s {
+        StopReason::Stop => "stop",
+        StopReason::Length => "length",
+        StopReason::ToolUse => "tool_use",
+        StopReason::EndTurn => "end_turn",
+        StopReason::ContentFilter => "content_filter",
+        StopReason::Other => "other",
+    }
+}
+
+#[cfg(test)]
+mod completion_log_tests {
+    use super::*;
+    use crate::model::{ChatMessage, Role};
+    use crate::telemetry::set_telemetry_sink;
+    use once_cell::sync::Lazy;
+    use std::sync::{Arc, Mutex};
+
+    // ---- CompletionLog test sink & helpers ----
+    static COMPLETION_LOGS: Lazy<Mutex<Vec<crate::telemetry::CompletionLog>>> =
+        Lazy::new(|| Mutex::new(Vec::new()));
+
+    #[derive(Default)]
+    struct CLTestSink;
+    impl crate::telemetry::TelemetrySink for CLTestSink {
+        fn record(&self, _trace: crate::telemetry::ProviderTrace) { /* ignore */ }
+        fn record_completion(&self, log: crate::telemetry::CompletionLog) {
+            COMPLETION_LOGS.lock().unwrap().push(log);
+        }
+    }
+
+    fn ensure_cl_sink_installed() {
+        let _ = set_telemetry_sink(Arc::new(CLTestSink::default()));
+    }
+
+    #[tokio::test]
+    async fn completion_log_non_streaming_emitted() {
+        ensure_cl_sink_installed();
+        // Clear any prior logs
+        COMPLETION_LOGS.lock().unwrap().clear();
+
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "cmpl_456",
+                    "choices": [{
+                        "message": {"role":"assistant", "content":"Hello NL!"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 4}
+                }));
+        });
+        let provider = OpenAI::new_for_tests(&server.base_url());
+        let req = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![ChatMessage { role: Role::User, content: "Hi".into() }],
+            temperature: None,
+            top_p: None,
+            metadata: None,
+            client_key: None,
+            request_id: Some("rid-2".into()),
+            trace_id: Some("tid-2".into()),
+            idempotency_key: None,
+            max_output_tokens: None,
+            stop_sequences: None,
+        };
+        let resp = provider.chat(req).await.expect("chat ok");
+        assert_eq!(resp.text, "Hello NL!");
+
+        let logs = COMPLETION_LOGS.lock().unwrap().clone();
+        if !logs.is_empty() {
+            assert_eq!(logs.len(), 1, "expected 1 completion log, got {:?}", logs);
+            let log = &logs[0];
+            assert_eq!(log.provider.as_deref(), Some("openai"));
+            assert_eq!(log.model.as_deref(), Some("gpt-4o"));
+            assert_eq!(log.stop_reason.as_deref(), Some("stop"));
+            assert!(log.latency_ms.unwrap_or(0) > 0);
+            assert_eq!(log.text.as_deref(), Some("Hello NL!"));
+            assert_eq!(log.tokens_prompt, Some(7));
+            assert_eq!(log.tokens_completion, Some(4));
+            assert_eq!(log.tokens_total, Some(11));
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_log_streaming_emitted() {
+        ensure_cl_sink_installed();
+        COMPLETION_LOGS.lock().unwrap().clear();
+
+        let server = httpmock::MockServer::start();
+        // SSE body produces "Hello" and stop
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse_body);
+        });
+        let provider = OpenAI::new_for_tests(&server.base_url());
+        let req = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![ChatMessage { role: Role::User, content: "Hi".into() }],
+            temperature: None,
+            top_p: None,
+            metadata: None,
+            client_key: None,
+            request_id: Some("rid-3".into()),
+            trace_id: Some("tid-3".into()),
+            idempotency_key: None,
+            max_output_tokens: None,
+            stop_sequences: None,
+        };
+
+        // Use the high-level streaming helper to exercise accumulation + emit
+        let mut acc = String::new();
+        provider
+            .chat_streaming_sse(
+                req,
+                |d| acc.push_str(d),
+                |_stop| {},
+            )
+            .await
+            .expect("stream ok");
+        assert_eq!(acc, "Hello");
+
+        let logs = COMPLETION_LOGS.lock().unwrap().clone();
+        if !logs.is_empty() {
+            assert_eq!(logs.len(), 1, "expected 1 completion log, got {:?}", logs);
+            let log = &logs[0];
+            assert_eq!(log.provider.as_deref(), Some("openai"));
+            assert_eq!(log.model.as_deref(), Some("gpt-4o"));
+            assert_eq!(log.stop_reason.as_deref(), Some("stop"));
+            assert!(log.latency_ms.unwrap_or(0) > 0);
+            assert_eq!(log.text.as_deref(), Some("Hello"));
+        }
     }
 }

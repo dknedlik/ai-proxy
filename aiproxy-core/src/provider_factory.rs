@@ -256,4 +256,8 @@ mod tests {
             _ => panic!("expected Validation error"),
         }
     }
+
+    // NOTE: Env-driven invalid-key tests omitted due to environment mutations
+    // requiring unsafe in this project setup. Validation helpers are covered
+    // above and `from_config` simply forwards those errors.
 }

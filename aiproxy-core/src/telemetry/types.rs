@@ -118,6 +118,55 @@ impl ProviderTrace {
     }
 }
 
+/// Structured, provider-agnostic completion log event.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CompletionLog {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub request_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub provider_request_id: Option<String>,
+    pub created_at_ms: Option<u64>,
+    pub latency_ms: Option<u64>,
+
+    pub stop_reason: Option<String>,
+    pub error_kind: Option<String>,
+    pub error_message: Option<String>,
+
+    pub text: Option<String>,
+    pub tokens_prompt: Option<u32>,
+    pub tokens_completion: Option<u32>,
+    pub tokens_total: Option<u32>,
+
+    pub span_name: Option<String>,
+    pub span_id: Option<String>,
+    pub parent_span_id: Option<String>,
+}
+
+impl CompletionLog {
+    pub fn new() -> Self { Self::default() }
+    pub fn provider(mut self, v: &str) -> Self { self.provider = Some(v.to_string()); self }
+    pub fn model(mut self, v: &str) -> Self { self.model = Some(v.to_string()); self }
+    pub fn request_id_opt(mut self, v: Option<&str>) -> Self { self.request_id = v.map(|s| s.to_string()); self }
+    pub fn turn_id_opt(mut self, v: Option<&str>) -> Self { self.turn_id = v.map(|s| s.to_string()); self }
+    pub fn provider_request_id_opt(mut self, v: Option<&str>) -> Self { self.provider_request_id = v.map(|s| s.to_string()); self }
+    pub fn created_at_ms(mut self, v: u64) -> Self { self.created_at_ms = Some(v); self }
+    pub fn latency_ms(mut self, v: u64) -> Self { self.latency_ms = Some(v); self }
+    pub fn stop_reason_opt(mut self, v: Option<&str>) -> Self { self.stop_reason = v.map(|s| s.to_string()); self }
+    pub fn error_kind_opt(mut self, v: Option<&str>) -> Self { self.error_kind = v.map(|s| s.to_string()); self }
+    pub fn error_message(mut self, v: &str) -> Self { self.error_message = Some(v.to_string()); self }
+    pub fn text_opt(mut self, v: Option<&str>) -> Self { self.text = v.map(|s| s.to_string()); self }
+    pub fn tokens(mut self, p: Option<u32>, c: Option<u32>, t: Option<u32>) -> Self {
+        self.tokens_prompt = p; self.tokens_completion = c; self.tokens_total = t; self
+    }
+    pub fn span(mut self, name: Option<&str>, id: Option<&str>, parent: Option<&str>) -> Self {
+        self.span_name = name.map(|s| s.to_string());
+        self.span_id = id.map(|s| s.to_string());
+        self.parent_span_id = parent.map(|s| s.to_string());
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

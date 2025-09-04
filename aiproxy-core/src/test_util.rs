@@ -1,0 +1,44 @@
+#![cfg(test)]
+
+use std::sync::{Arc, Mutex};
+
+use once_cell::sync::Lazy;
+
+use crate::telemetry::{self, ProviderTrace, TelemetrySink};
+
+// Shared storage for ProviderTrace events emitted during tests
+pub static TRACE_LOGS: Lazy<Mutex<Vec<ProviderTrace>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+#[derive(Default)]
+pub struct TestTraceSink;
+
+impl TelemetrySink for TestTraceSink {
+    fn record(&self, tr: ProviderTrace) {
+        TRACE_LOGS.lock().unwrap().push(tr);
+    }
+    // record_completion left as default no-op; provider completion tests use their own sinks
+}
+
+/// Install the global trace sink (idempotent) and enable capture for this thread.
+pub fn install_trace_sink() {
+    // Try installing; ignore if already set in this process
+    let _ = telemetry::set_telemetry_sink(Arc::new(TestTraceSink::default()));
+    telemetry::test_set_capture_enabled(true);
+    clear_traces();
+}
+
+pub fn clear_traces() {
+    TRACE_LOGS.lock().unwrap().clear();
+}
+
+/// Utility to find the most recent trace matching a predicate
+pub fn find_trace<F: Fn(&ProviderTrace) -> bool>(pred: F) -> Option<ProviderTrace> {
+    TRACE_LOGS
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|t| pred(t))
+        .cloned()
+}
+
